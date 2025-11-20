@@ -3,7 +3,7 @@
 Документ описывает архитектуру системы автоматической классификации обращений Service Desk с учетом текущей реализации.
 
 **Дата обновления:** 2025-11-19  
-**Версия:** 3.3 (актуализировано с учетом фактической реализации статусов, эндпоинтов и потоков данных)
+**Версия:** 3.4 (актуализировано с учетом фактической реализации: добавлены эндпоинты синхронизации Jira, уточнены статусы и коннекторы)
 
 ---
 
@@ -38,7 +38,7 @@ graph TB
         end
         
         subgraph Output["📤 OUTPUT LAYER"]
-            OutputService["🔹 Output Service<br/>FastAPI - Port 8003<br/>POST /process_result<br/>GET /health<br/>- Destination connectors (Jira/FileSystem/Mock)<br/>- DESTINATION_TYPE configuration<br/>- Auto-process decision<br/>- Config Service integration<br/>- Fallback to DB<br/>- Error handling<br/>- Retry mechanisms"]
+            OutputService["🔹 Output Service<br/>FastAPI - Port 8003<br/>POST /process_result<br/>GET /health<br/>POST /sync/jira/ticket<br/>POST /sync/jira/batch<br/>POST /sync/jira/jql<br/>POST /sync/jira/all<br/>GET /jira/ticket/{id}<br/>GET /jira/search<br/>- Destination connectors (Jira/FileSystem/Mock)<br/>- DESTINATION_TYPE configuration<br/>- Auto-process decision<br/>- Config Service integration<br/>- Fallback to DB<br/>- Error handling<br/>- Retry mechanisms<br/>- Jira synchronization service"]
         end
         
         subgraph Data["💾 DATA & PERSISTENCE"]
@@ -372,9 +372,11 @@ stateDiagram-v2
     processing --> failed: Error occurred
     
     classified --> completed: Output Service done
-    classified --> failed: Output Service error (редко, классификация успешна)
+    classified --> classified: Output Service error\n(остается в classified,\nтолько error_message)
     
     failed --> queued: POST /reprocess
+    completed --> queued: POST /reprocess\n(force=true)
+    cancelled --> queued: POST /reprocess
     failed --> [*]: Manual resolution
     
     completed --> [*]: Ticket closed
@@ -384,12 +386,16 @@ stateDiagram-v2
         Status: queued
         Stored in: PostgreSQL
         Queued in: Redis DB 0
+        POST /reprocess возвращает
+        status='queued_for_reprocessing'
+        но в БД сохраняется как 'queued'
     end note
     
     note right of processing
         Status: processing
         Worker processing
         ML Service classifying
+        Только если status='queued'
     end note
     
     note right of classified
@@ -398,13 +404,23 @@ stateDiagram-v2
         confidence calculated
         decision made
         Ready for Output Service
+        При ошибке Output Service
+        остается в classified
     end note
     
     note right of completed
         Status: completed
         Sent to destination
         (Jira/FileSystem/Mock)
-        external_id set
+        jira_ticket_id set
+        sent_to_jira_at set
+    end note
+    
+    note right of failed
+        Status: failed
+        error_message set
+        Может быть переобработан
+        через POST /reprocess
     end note
 ```
 
@@ -439,7 +455,9 @@ stateDiagram-v2
 - ✅ Обработка результатов классификации
 - ✅ Плагинные коннекторы назначения (Destination Connectors):
   - **Jira Connector:** отправка в Jira REST API (требует `DESTINATION_TYPE=jira`)
-  - **FileSystem Connector:** сохранение JSON файлов в `OUTPUT_DIR` (по умолчанию, `DESTINATION_TYPE=filesystem`)
+    - Поддерживает стандартный Jira REST API (`/rest/api/3/issue`)
+    - Поддерживает Jira Service Desk API (`/rest/servicedeskapi/request`) при `JIRA_USE_SERVICEDESK_API=true`
+  - **FileSystem Connector:** сохранение JSON файлов в `OUTPUT_DIR` (по умолчанию, `DESTINATION_TYPE=filesystem` или `fs` или `file`)
   - **Mock Connector:** тестовый режим без отправки (`DESTINATION_TYPE=mock`)
 - ✅ Выбор коннектора через переменную окружения `DESTINATION_TYPE`
 - ✅ Определение приоритетов из Config Service (auto_process_priority, manual_review_priority)
@@ -447,6 +465,9 @@ stateDiagram-v2
 - ✅ Retry механизмы для Jira
 - ✅ Аудит действий (`audit_logs`)
 - ✅ Отправка только при `decision=auto-process`
+- ✅ Синхронизация данных из Jira для дообучения модели (JiraSyncService)
+  - Синхронизация actual_type, feedback_status из Jira в PostgreSQL
+  - Поддержка пакетной синхронизации и синхронизации по JQL
 
 ### 5. Dashboard (Port 8501)
 - ✅ **Demo режим:** Прямая классификация через ML Service (без логирования в БД)
@@ -496,6 +517,13 @@ stateDiagram-v2
 - `GET /health` - проверка работоспособности
   - Проверяет подключение к PostgreSQL
   - Показывает статус Jira (если `DESTINATION_TYPE=jira`)
+- `POST /sync/jira/ticket` - синхронизация одного тикета из Jira
+  - Получает данные тикета из Jira и обновляет actual_type, feedback_status в PostgreSQL
+- `POST /sync/jira/batch` - пакетная синхронизация тикетов из Jira
+- `POST /sync/jira/jql` - синхронизация тикетов по JQL запросу
+- `POST /sync/jira/all` - синхронизация всех тикетов с jira_ticket_id
+- `GET /jira/ticket/{jira_ticket_id}` - получение данных тикета из Jira (без синхронизации)
+- `GET /jira/search` - поиск тикетов в Jira по JQL (без синхронизации)
 
 ---
 
@@ -633,21 +661,41 @@ Dashboard → Ingestion Service (POST /tickets)
 - **JiraConnector:** отправка тикетов в Jira REST API
   - Требует `DESTINATION_TYPE=jira`
   - Использует конфигурацию из Config Service (jira_url, jira_user, jira_api_token)
+  - Поддерживает два режима:
+    - Стандартный Jira REST API (`/rest/api/3/issue`) - по умолчанию
+    - Jira Service Desk API (`/rest/servicedeskapi/request`) - при `JIRA_USE_SERVICEDESK_API=true`
+  - Для Service Desk API требуется `JIRA_SERVICE_DESK_ID` и `JIRA_REQUEST_TYPE_ID`
   - Поддерживает retry механизмы (MAX_RETRY_ATTEMPTS)
   - Опциональная проверка подключения через `JIRA_VALIDATE_CONNECTION`
 - **FileSystemConnector:** сохранение результатов в JSON файлы
-  - По умолчанию (`DESTINATION_TYPE=filesystem` или не указан)
+  - По умолчанию (`DESTINATION_TYPE=filesystem`, `fs` или `file`)
   - Сохраняет в директорию `OUTPUT_DIR` (по умолчанию `./out`)
   - Формат файла: `{ticket_id}_{timestamp}.json`
+  - Поддерживает нормализацию кодировки UTF-8 (исправление проблем с Windows-1251)
 - **MockConnector:** тестовый режим
   - `DESTINATION_TYPE=mock`
-  - Генерирует фальшивый ID без реальной отправки
+  - Генерирует external_id в формате `MOCK-{timestamp}` без реальной отправки
   - Используется для тестирования без внешних зависимостей
+
+### Jira Synchronization Service
+- **Назначение:** Синхронизация данных из Jira в PostgreSQL для дообучения модели
+- **Функциональность:**
+  - Извлечение категории из Jira (custom fields, labels, components, issue type)
+  - Обновление `actual_type` в PostgreSQL при расхождении с `predicted_type`
+  - Обновление `feedback_status` и `feedback_correct_type` для обратной связи
+  - Пометка тикетов как `training_ready` для дообучения
+- **Эндпоинты:**
+  - `POST /sync/jira/ticket` - синхронизация одного тикета
+  - `POST /sync/jira/batch` - пакетная синхронизация
+  - `POST /sync/jira/jql` - синхронизация по JQL запросу
+  - `POST /sync/jira/all` - синхронизация всех тикетов с jira_ticket_id
+  - `GET /jira/ticket/{jira_ticket_id}` - получение данных из Jira (без синхронизации)
+  - `GET /jira/search` - поиск в Jira по JQL (без синхронизации)
 
 ---
 
 **Важно:** `POST /classify` находится **только в ML Service (Port 8001)**, а не в Ingestion Service. Это правильное разделение ответственности в микросервисной архитектуре.
 
 **Дата обновления:** 2025-11-19  
-**Версия:** 3.3 (актуализировано с учетом фактической реализации статусов, эндпоинтов и потоков данных)
+**Версия:** 3.4 (актуализировано с учетом фактической реализации: добавлены эндпоинты синхронизации Jira, уточнены статусы и коннекторы)
 

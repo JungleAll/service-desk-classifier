@@ -9,7 +9,7 @@ Service Desk Classifier — API Reference
 - Аутентификация: не требуется для демо; в проде добавьте OAuth/JWT/Key (вне рамок данного референса).
 - CORS: включен для всех сервисов.
 - Коды ошибок: 200/201 OK/Created; 202 Accepted; 400 Validation/Bad Request; 404 Not Found; 500 Internal; 503 Service Unavailable.
-- Статус: Документ обновлен и соответствует текущей реализации всех сервисов (проверено 2025-11-19).
+- Статус: Документ обновлен и соответствует текущей реализации всех сервисов (проверено 2025-11-19, обновлено 2025-11-19).
 
 Сервисы и базовые URL
 - Ingestion Service: http://localhost:8000
@@ -45,12 +45,12 @@ Service Desk Classifier — API Reference
 - Query: 
   - limit?: number (default: 50, min: 1, max: 1000) — количество результатов
   - offset?: number (default: 0, min: 0) — смещение для пагинации
-  - status?: string — фильтр по статусу
+  - status?: string — фильтр по статусу (алиас для status_filter)
   - source?: string — фильтр по источнику
   - priority?: string — фильтр по приоритету
   - date_from?: string (YYYY-MM-DD) — фильтр с даты
   - date_to?: string (YYYY-MM-DD) — фильтр по дату
-  - sort?: string (default: "-created_at") — сортировка (префикс "-" для DESC)
+  - sort?: string (default: "-created_at") — сортировка (префикс "-" для DESC, поддерживаемые поля: created_at, updated_at, processed_at, status)
 - Response (200)
   - tickets: Ticket[] (массив объектов обращений)
   - total: number — общее количество
@@ -68,10 +68,10 @@ Service Desk Classifier — API Reference
   - status: string — 'queued' | 'processing' | 'classified' | 'completed' | 'failed' | 'cancelled'
   - predicted_type?: string — предсказанный тип (если классифицирован)
   - confidence?: number — уверенность модели (если классифицирован)
-  - probabilities?: object — вероятности для всех классов в формате JSONB (если классифицирован)
+  - probabilities?: Dict<string, number> — вероятности для всех классов в формате JSONB (если классифицирован)
   - decision?: string — решение ('auto-process' | 'manual-review', если классифицирован)
   - model_version?: string — версия модели, использованная для классификации
-  - jira_issue_id?: string — ID тикета в Jira (или external_id для FileSystem/Mock)
+  - jira_issue_id?: string — ID тикета в Jira (или external_id для FileSystem/Mock). В БД хранится как jira_ticket_id, в ответе маппится в jira_issue_id
   - jira_link?: string — ссылка на тикет в Jira (или путь к файлу для FileSystem)
   - created_at: ISO datetime
   - processed_at?: ISO datetime — время завершения классификации
@@ -100,7 +100,7 @@ Service Desk Classifier — API Reference
   - predicted_type?: string — предсказанный тип (если классифицирован)
   - confidence?: number — уверенность модели (если классифицирован)
   - decision?: string — решение ('auto-process' | 'manual-review', если классифицирован)
-  - jira_ticket_id?: string — ID тикета в Jira или external_id (если отправлен)
+  - jira_ticket_id?: string — ID тикета в Jira или external_id (если отправлен). В GET /tickets/{ticket_id} возвращается как jira_issue_id
   - created_at?: ISO datetime
   - processed_at?: ISO datetime — время завершения классификации
   - error_message?: string — сообщение об ошибке (если есть)
@@ -164,13 +164,14 @@ Service Desk Classifier — API Reference
   - decision: 'auto-process' | 'manual-review' (определяется по confidence_threshold из Config Service)
   - processing_time_ms: number — время обработки в миллисекундах
 - Поведение:
-  - Проверяет кэш Redis DB 1 (cache_predictions:{version}:{hash})
+  - Проверяет кэш Redis DB 1 (ключ: cache_predictions:{version}:{hash}, где hash — MD5 хэш текста)
   - Если кэш найден → возвращает результат из кэша (быстро)
   - Если кэш не найден:
-    - Проверяет версию модели из Config Service (автоперезагрузка при несоответствии)
+    - Проверяет версию модели из Config Service перед классификацией (автоперезагрузка при несоответствии)
     - Выполняет классификацию через модель
     - Сохраняет результат в кэш (TTL: 3600s)
   - Определяет decision на основе confidence_threshold из Config Service
+  - Версия модели включается в ключ кэша, чтобы после переключения версии не использовать старые результаты
 - Errors: 400 (некорректный текст), 503 (модель не загружена)
 
 2.2 POST /classify/batch — Пакетная классификация
@@ -318,8 +319,8 @@ Service Desk Classifier — API Reference
   - success: boolean
   - message: string
   - ticket_id: string
-  - jira_ticket_id?: string (external_id для всех коннекторов: Jira issue key, FileSystem filename, Mock ID)
-  - jira_link?: string (ссылка для Jira, путь к файлу для FileSystem, null для Mock)
+  - jira_ticket_id?: string — external_id для всех коннекторов: Jira issue key (например, SD-123), FileSystem filename (например, FS-20251119T063936), Mock ID (например, MOCK-20251119063936)
+  - jira_link?: string — ссылка для Jira (например, https://jira.example.com/browse/SD-123), путь к файлу для FileSystem (абсолютный путь), null для Mock
   - status: 'completed'
   - processed_at?: ISO datetime
   - retry_count?: number
@@ -384,20 +385,24 @@ Service Desk Classifier — API Reference
 - Path parameters
   - jira_ticket_id: string — ключ тикета в Jira (например, SD-123)
 - Query parameters
-  - expand?: string — список полей для расширения (например, "fields,changelog")
+  - expand?: string — список полей для расширения через запятую (например, "fields,changelog")
 - Response (200)
   - Данные тикета из Jira REST API (полный объект issue)
   - Содержит fields, key, id, self и другие стандартные поля Jira API
+  - Формат ответа соответствует Jira REST API v3
 - Поведение:
   - Получает данные тикета из Jira через REST API
   - Не выполняет синхронизацию с PostgreSQL
   - Используется для просмотра данных тикета без обновления БД
-- Errors: 404 (тикет не найден), 503 (Jira отключен), 500 (ошибка запроса)
+- Errors: 
+  - 404 (тикет не найден в Jira или нет доступа)
+  - 503 (Jira клиент отключен или не настроен)
+  - 500 (ошибка запроса к Jira)
 
 4.8 GET /jira/search — Поиск тикетов в Jira по JQL
 - Query parameters
   - jql: string — JQL запрос (обязательный, например, "project = SD AND status = Resolved")
-  - fields?: string — список полей через запятую (например, "key,summary,status")
+  - fields?: string — список полей через запятую (например, "key,summary,status"). Если не указан, возвращаются все поля
   - max_results?: number (default: 50, max: 1000) — максимальное количество результатов
   - start_at?: number (default: 0) — смещение для пагинации
 - Response (200)
@@ -405,7 +410,7 @@ Service Desk Classifier — API Reference
   - startAt: number — смещение
   - maxResults: number — максимальное количество результатов
   - total: number — общее количество найденных тикетов
-  - issues: Array<Issue> — массив тикетов из Jira
+  - issues: Array<Issue> — массив тикетов из Jira (формат соответствует Jira REST API v3)
 - Поведение:
   - Выполняет поиск тикетов в Jira по JQL запросу
   - Не выполняет синхронизацию с PostgreSQL
@@ -414,7 +419,10 @@ Service Desk Classifier — API Reference
   - "project = SD AND status = Resolved"
   - "project = SD AND updated >= -7d"
   - "project = SD AND assignee = currentUser()"
-- Errors: 503 (Jira отключен), 500 (ошибка запроса)
+  - "project = SD AND labels = 'training-ready'"
+- Errors: 
+  - 503 (Jira клиент отключен или не настроен)
+  - 500 (ошибка запроса к Jira или не удалось выполнить поиск)
 
 Коннекторы (ITicketDestination)
 - process_and_send(payload) -> (external_id, link, retry_count)
@@ -422,14 +430,22 @@ Service Desk Classifier — API Reference
 - get_name()
 
 Переменные окружения (Output)
-- DESTINATION_TYPE: 'filesystem'|'mock'|'jira' (default: 'filesystem')
+- DESTINATION_TYPE: 'filesystem'|'mock'|'jira'|'fs'|'file' (default: 'filesystem')
+  - 'filesystem', 'fs', 'file' → FileSystemConnector
+  - 'jira' → JiraConnector
+  - 'mock' → MockConnector
 - OUTPUT_DIR: каталог для файлов (filesystem; default './out')
 - Jira коннектор (стандартный API):
-  - JIRA_URL, JIRA_USER, JIRA_API_TOKEN, JIRA_PROJECT_KEY
+  - JIRA_URL: URL Jira сервера (обязательно)
+  - JIRA_USER: имя пользователя Jira (обязательно)
+  - JIRA_API_TOKEN: API токен Jira (обязательно)
+  - JIRA_PROJECT_KEY: ключ проекта Jira (обязательно)
+  - JIRA_ENABLED: 'true'|'false' (default: 'true') — включить/выключить Jira коннектор
 - Jira коннектор (Service Desk API):
   - JIRA_USE_SERVICEDESK_API: 'true'|'false' (default: 'false') — использовать Service Desk API вместо стандартного
   - JIRA_SERVICE_DESK_ID: ID Service Desk проекта (обязательно при JIRA_USE_SERVICEDESK_API=true)
   - JIRA_REQUEST_TYPE_ID: ID типа запроса (Request Type) (обязательно при JIRA_USE_SERVICEDESK_API=true)
+- JIRA_VALIDATE_CONNECTION: 'true'|'false' (default: 'false') — проверять подключение к Jira при валидации коннектора
   
 Примечание: Service Desk API (`/rest/servicedeskapi/request`) рекомендуется для работы с Jira Service Management проектами, так как учитывает специфику Service Desk (service projects, request types, SLA и т.д.). Стандартный API (`/rest/api/3/issue`) подходит для обычных Jira проектов.
 
@@ -457,6 +473,5 @@ Service Desk Classifier — API Reference
 - Быстрый старт: QUICKSTART.md
 - Подробный запуск: startup-guide.md
 - Руководство по реализации: API_IMPLEMENTATION_GUIDE.md
-- Статус реализации: API_IMPLEMENTATION_STATUS.md
 
 
