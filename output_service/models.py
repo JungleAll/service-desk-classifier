@@ -40,3 +40,51 @@ class ErrorResponse(BaseModel):
     error: str = Field(..., description="Описание ошибки")
     detail: Optional[str] = Field(None, description="Детали ошибки")
 
+
+class SyncTicketRequest(BaseModel):
+    """Модель запроса для синхронизации тикета из Jira"""
+    
+    jira_ticket_id: str = Field(..., description="Ключ тикета в Jira (например, SD-123)")
+    ticket_id: Optional[str] = Field(None, description="ID тикета в нашей системе (опционально)")
+    category_field: Optional[str] = Field(None, description="Имя custom field для категории в Jira")
+
+
+class SyncBatchRequest(BaseModel):
+    """Модель запроса для пакетной синхронизации"""
+    
+    jira_ticket_ids: list[str] = Field(..., description="Список ключей тикетов в Jira")
+    category_field: Optional[str] = Field(None, description="Имя custom field для категории в Jira")
+
+
+class SyncJQLRequest(BaseModel):
+    """Модель запроса для синхронизации по JQL"""
+    
+    jql: str = Field(..., description="JQL запрос для поиска тикетов в Jira")
+    category_field: Optional[str] = Field(None, description="Имя custom field для категории в Jira")
+    max_results: int = Field(100, ge=1, le=1000, description="Максимальное количество тикетов")
+
+
+class SyncAllRequest(BaseModel):
+    """Модель запроса для синхронизации всех тикетов"""
+    
+    category_field: Optional[str] = Field(None, description="Имя custom field для категории в Jira")
+    limit: int = Field(100, ge=1, le=1000, description="Максимальное количество тикетов")
+
+
+class SyncResultResponse(BaseModel):
+    """Модель ответа при синхронизации"""
+    
+    success: bool = Field(..., description="Успешно ли выполнена синхронизация")
+    jira_ticket_id: str = Field(..., description="Ключ тикета в Jira")
+    ticket_id: Optional[str] = Field(None, description="ID тикета в нашей системе")
+    updated_fields: list[str] = Field(default_factory=list, description="Обновленные поля")
+    errors: list[str] = Field(default_factory=list, description="Ошибки при синхронизации")
+
+
+class SyncBatchResponse(BaseModel):
+    """Модель ответа при пакетной синхронизации"""
+    
+    total: int = Field(..., description="Общее количество тикетов")
+    successful: int = Field(..., description="Успешно синхронизировано")
+    failed: int = Field(..., description="Не удалось синхронизировать")
+    details: list[SyncResultResponse] = Field(default_factory=list, description="Детали по каждому тикету")

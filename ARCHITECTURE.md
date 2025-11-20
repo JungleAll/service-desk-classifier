@@ -2,8 +2,8 @@
 
 Документ описывает архитектуру системы автоматической классификации обращений Service Desk с учетом текущей реализации.
 
-**Дата обновления:** 2025-01-18  
-**Версия:** 3.2 (обновлено с учетом плагинной архитектуры Destination Connectors в Output Service)
+**Дата обновления:** 2025-11-19  
+**Версия:** 3.3 (актуализировано с учетом фактической реализации статусов, эндпоинтов и потоков данных)
 
 ---
 
@@ -372,7 +372,7 @@ stateDiagram-v2
     processing --> failed: Error occurred
     
     classified --> completed: Output Service done
-    classified --> failed: Output Service error
+    classified --> failed: Output Service error (редко, классификация успешна)
     
     failed --> queued: POST /reprocess
     failed --> [*]: Manual resolution
@@ -397,12 +397,14 @@ stateDiagram-v2
         predicted_type set
         confidence calculated
         decision made
+        Ready for Output Service
     end note
     
     note right of completed
         Status: completed
-        Sent to Jira
-        jira_ticket_id set
+        Sent to destination
+        (Jira/FileSystem/Mock)
+        external_id set
     end note
 ```
 
@@ -505,42 +507,48 @@ stateDiagram-v2
   → Проверка Config Service (service_enabled)
   → Сохранение в PostgreSQL (ticket_events, status: 'queued')
   → Добавление в очередь Redis DB 0 (pending_tickets)
-  → Ответ клиенту (ticket_id, status: 'queued')
+  → Ответ клиенту (ticket_id, status: 'queued', created_at, estimated_processing_time: 2000ms)
 ```
 
 ### 2. Классификация (Worker Mode)
 ```
-ML Service Worker → Redis DB 0 (BLPOP pending_tickets)
+ML Service Worker → Redis DB 0 (BLPOP pending_tickets, timeout: 5s)
+  → Проверка статуса тикета в БД (должен быть 'queued')
   → Обновление статуса в PostgreSQL (status: 'processing')
-  → Проверка кэша Redis DB 1 (cache_predictions)
+  → Проверка версии модели из Config Service (автоперезагрузка при несоответствии)
+  → Проверка кэша Redis DB 1 (cache_predictions:{version}:{hash})
   → Если нет в кэше:
-    → Получение конфигурации из Config Service
+    → Получение порога уверенности из Config Service
     → Предобработка текста
     → Векторизация (TF-IDF)
     → Классификация (LogisticRegression)
-    → Сохранение в кэш Redis DB 1 (TTL: 1h)
-  → Обновление PostgreSQL (predicted_type, confidence, status: 'classified')
-  → Отправка в Output Service
+    → Сохранение в кэш Redis DB 1 (TTL: 3600s)
+  → Определение decision (auto-process/manual-review) по порогу
+  → Обновление PostgreSQL (predicted_type, confidence, probabilities, decision, model_version, status: 'classified', processed_at)
+  → Отправка в Output Service (POST /process_result)
 ```
 
 ### 3. Обработка результата
 ```
 Output Service (POST /process_result)
-  → Получение конфигурации из Config Service API:
+  → Получение конфигурации из Config Service API (GET /config):
     - Приоритеты (auto_process_priority, manual_review_priority)
-    - Jira конфигурация (jira_enabled, jira_url)
+    - Jira конфигурация (jira_enabled, jira_url, jira_user, jira_api_token, jira_project_key)
   → Fallback на БД при недоступности Config Service
-  → Определение приоритета на основе decision
+  → Определение приоритета на основе decision:
+    - decision='auto-process' → auto_process_priority (default: 'medium')
+    - decision='manual-review' → manual_review_priority (default: 'low')
   → Выбор коннектора назначения через DESTINATION_TYPE:
     - DESTINATION_TYPE=jira → JiraConnector
     - DESTINATION_TYPE=filesystem → FileSystemConnector (по умолчанию)
     - DESTINATION_TYPE=mock → MockConnector
   → Отправка в назначение при decision=auto-process:
     - Jira: создание тикета через REST API с retry механизмами (MAX_RETRY_ATTEMPTS)
-    - FileSystem: сохранение JSON в OUTPUT_DIR (по умолчанию ./out)
-    - Mock: генерация MOCK-<timestamp> без реальной отправки
-  → Обновление PostgreSQL (jira_ticket_id, jira_link, priority, status: 'completed')
-  → Запись в audit_logs
+    - FileSystem: сохранение JSON в OUTPUT_DIR (default: ./out), формат: {ticket_id}_{timestamp}.json
+    - Mock: генерация external_id в формате MOCK-{timestamp} без реальной отправки
+  → Обновление PostgreSQL:
+    - ticket_events: jira_ticket_id (или external_id), jira_link (или file path), priority, status: 'completed', sent_to_jira_at
+    - audit_logs: запись действия (jira_created/filesystem_saved/mock_generated)
 ```
 
 ### 4. Dashboard - Demo Mode
@@ -640,6 +648,6 @@ Dashboard → Ingestion Service (POST /tickets)
 
 **Важно:** `POST /classify` находится **только в ML Service (Port 8001)**, а не в Ingestion Service. Это правильное разделение ответственности в микросервисной архитектуре.
 
-**Дата обновления:** 2025-01-18  
-**Версия:** 3.2 (обновлено с учетом плагинной архитектуры Destination Connectors в Output Service)
+**Дата обновления:** 2025-11-19  
+**Версия:** 3.3 (актуализировано с учетом фактической реализации статусов, эндпоинтов и потоков данных)
 

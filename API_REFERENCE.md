@@ -9,7 +9,7 @@ Service Desk Classifier — API Reference
 - Аутентификация: не требуется для демо; в проде добавьте OAuth/JWT/Key (вне рамок данного референса).
 - CORS: включен для всех сервисов.
 - Коды ошибок: 200/201 OK/Created; 202 Accepted; 400 Validation/Bad Request; 404 Not Found; 500 Internal; 503 Service Unavailable.
-- Статус: Документ обновлен и соответствует текущей реализации всех сервисов (проверено 2025-01-18).
+- Статус: Документ обновлен и соответствует текущей реализации всех сервисов (проверено 2025-11-19).
 
 Сервисы и базовые URL
 - Ingestion Service: http://localhost:8000
@@ -65,36 +65,45 @@ Service Desk Classifier — API Reference
   - user_id?: string
   - email?: string
   - priority?: string
-  - status: string
-  - predicted_type?: string — предсказанный тип (если обработано)
-  - confidence?: number — уверенность модели (если обработано)
-  - probabilities?: object — вероятности для всех классов (если обработано)
-  - decision?: string — решение ('auto-process' | 'manual-review', если обработано)
-  - jira_issue_id?: string — ID тикета в Jira
-  - jira_link?: string — ссылка на тикет в Jira
+  - status: string — 'queued' | 'processing' | 'classified' | 'completed' | 'failed' | 'cancelled'
+  - predicted_type?: string — предсказанный тип (если классифицирован)
+  - confidence?: number — уверенность модели (если классифицирован)
+  - probabilities?: object — вероятности для всех классов в формате JSONB (если классифицирован)
+  - decision?: string — решение ('auto-process' | 'manual-review', если классифицирован)
+  - model_version?: string — версия модели, использованная для классификации
+  - jira_issue_id?: string — ID тикета в Jira (или external_id для FileSystem/Mock)
+  - jira_link?: string — ссылка на тикет в Jira (или путь к файлу для FileSystem)
   - created_at: ISO datetime
-  - processed_at?: ISO datetime
-  - sent_to_jira_at?: ISO datetime
+  - processed_at?: ISO datetime — время завершения классификации
+  - sent_to_jira_at?: ISO datetime — время отправки в destination
+  - error_message?: string — сообщение об ошибке (если есть)
+  - retry_count?: number — количество попыток
 - Errors: 404, 500
 
 1.4 GET /status/{ticket_id} — Статус обработки
 - Response (200)
   - ticket_id: string
-  - status: 'queued' | 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled'
-  - progress?: 0..100 — прогресс обработки в процентах
+  - status: 'queued' | 'processing' | 'classified' | 'completed' | 'failed' | 'cancelled'
+    - 'queued': тикет создан и поставлен в очередь
+    - 'processing': тикет обрабатывается ML Service Worker
+    - 'classified': классификация завершена, ожидает обработки Output Service
+    - 'completed': полностью обработан (отправлен в destination)
+    - 'failed': ошибка при обработке
+    - 'cancelled': отменен пользователем
+  - progress?: 0..100 — прогресс обработки в процентах (вычисляется на основе статуса)
   - steps?: object — объект с шагами обработки (received, validated, queued, processing, classified, sent_to_jira, completed)
-  - current_step?: string — текущий шаг обработки
-  - errors?: string[] — массив ошибок (если есть)
+  - current_step?: string — текущий шаг обработки (совпадает со status)
+  - errors?: string[] — массив ошибок (если есть, из error_message)
   - retry_count?: number — количество попыток
   - text?: string — текст обращения
   - source?: string — источник
-  - predicted_type?: string — предсказанный тип
-  - confidence?: number — уверенность модели
-  - decision?: string — решение ('auto-process' | 'manual-review')
-  - jira_ticket_id?: string — ID тикета в Jira
+  - predicted_type?: string — предсказанный тип (если классифицирован)
+  - confidence?: number — уверенность модели (если классифицирован)
+  - decision?: string — решение ('auto-process' | 'manual-review', если классифицирован)
+  - jira_ticket_id?: string — ID тикета в Jira или external_id (если отправлен)
   - created_at?: ISO datetime
-  - processed_at?: ISO datetime
-  - error_message?: string — сообщение об ошибке
+  - processed_at?: ISO datetime — время завершения классификации
+  - error_message?: string — сообщение об ошибке (если есть)
 
 1.5 POST /tickets/{ticket_id}/cancel — Отменить обработку
 - Request
@@ -109,12 +118,18 @@ Service Desk Classifier — API Reference
 1.6 POST /tickets/{ticket_id}/reprocess — Переотправить в очередь
 - Request
   - text?: string — опционально заменить исходный текст
-  - force?: boolean (default: false) — принудительно переоформить даже если уже обработано
+  - force?: boolean (default: false) — принудительно переоформить даже если уже обработано (completed)
 - Response (202 Accepted)
   - ticket_id: string
-  - status: 'queued_for_reprocessing'
-  - previous_classification?: string — предыдущая классификация (если была)
+  - status: 'queued_for_reprocessing' (в БД устанавливается 'queued')
+  - previous_classification?: string — предыдущая классификация predicted_type (если была)
   - requeued_at: ISO datetime
+- Поведение:
+  - Проверяет текущий статус тикета
+  - Если статус 'completed' и force=false → ошибка 400
+  - Обновляет статус на 'queued' в БД
+  - Опционально обновляет текст, если передан
+  - Тикет будет обработан Worker'ом заново
 - Errors: 404, 400 (если нельзя переоформить без force), 500
 
 1.7 POST /tickets/batch — Пакетная загрузка
@@ -145,10 +160,18 @@ Service Desk Classifier — API Reference
   - predicted_type: string
   - confidence: number (0..1)
   - probabilities: Array<{category: string, score: number}> (отсортировано по убыванию; пустой массив, если return_probabilities=false)
-  - model_version: string
-  - decision: 'auto-process' | 'manual-review' (по порогу конфигурации)
-  - processing_time_ms: number
-- Errors: 400, 503
+  - model_version: string — версия модели, использованная для классификации
+  - decision: 'auto-process' | 'manual-review' (определяется по confidence_threshold из Config Service)
+  - processing_time_ms: number — время обработки в миллисекундах
+- Поведение:
+  - Проверяет кэш Redis DB 1 (cache_predictions:{version}:{hash})
+  - Если кэш найден → возвращает результат из кэша (быстро)
+  - Если кэш не найден:
+    - Проверяет версию модели из Config Service (автоперезагрузка при несоответствии)
+    - Выполняет классификацию через модель
+    - Сохраняет результат в кэш (TTL: 3600s)
+  - Определяет decision на основе confidence_threshold из Config Service
+- Errors: 400 (некорректный текст), 503 (модель не загружена)
 
 2.2 POST /classify/batch — Пакетная классификация
 - Request: { texts: string[] }
@@ -280,15 +303,23 @@ Service Desk Classifier — API Reference
   - probabilities?: Record<string, number>
   - metadata?: object
 - Поведение
-  - При decision='auto-process' — публикация в целевую систему через выбранный коннектор
-  - Плагинные коннекторы выбираются по ENV DESTINATION_TYPE: 'filesystem' | 'mock' | 'jira'
-  - Обновляет запись в ticket_events и пишет аудиты
+  - Получает конфигурацию из Config Service API (GET /config) с fallback на БД
+  - Определяет приоритет на основе decision:
+    - decision='auto-process' → auto_process_priority (default: 'medium')
+    - decision='manual-review' → manual_review_priority (default: 'low')
+  - При decision='auto-process' — публикация в целевую систему через выбранный коннектор:
+    - DESTINATION_TYPE=jira → JiraConnector (создает тикет через Jira REST API или Service Desk API в зависимости от конфигурации)
+    - DESTINATION_TYPE=filesystem → FileSystemConnector (сохраняет JSON в OUTPUT_DIR)
+    - DESTINATION_TYPE=mock → MockConnector (генерирует MOCK-{timestamp})
+  - При decision='manual-review' — только обновление БД, без отправки
+  - Обновляет запись в ticket_events (status='completed', external_id, link, priority, sent_to_jira_at)
+  - Записывает в audit_logs (action, status, details, retry_count)
 - Response (200)
   - success: boolean
   - message: string
   - ticket_id: string
-  - jira_ticket_id?: string (external_id при filesystem/mock тоже заполняется)
-  - jira_link?: string (link/path)
+  - jira_ticket_id?: string (external_id для всех коннекторов: Jira issue key, FileSystem filename, Mock ID)
+  - jira_link?: string (ссылка для Jira, путь к файлу для FileSystem, null для Mock)
   - status: 'completed'
   - processed_at?: ISO datetime
   - retry_count?: number
@@ -299,6 +330,92 @@ Service Desk Classifier — API Reference
   - postgresql: 'connected' | 'disconnected'
   - jira_enabled: boolean — включена ли интеграция с Jira
 
+4.3 POST /sync/jira/ticket — Синхронизация одного тикета из Jira
+- Request
+  - jira_ticket_id: string — ключ тикета в Jira (например, SD-123)
+  - ticket_id?: string — ID тикета в нашей системе (опционально, будет найден автоматически)
+  - category_field?: string — имя custom field для категории в Jira (например, "customfield_10001")
+- Response (200)
+  - success: boolean — успешно ли выполнена синхронизация
+  - jira_ticket_id: string — ключ тикета в Jira
+  - ticket_id?: string — ID тикета в нашей системе
+  - updated_fields: string[] — список обновленных полей (actual_type, feedback_status, training_ready и т.д.)
+  - errors: string[] — список ошибок при синхронизации
+- Поведение:
+  - Получает данные тикета из Jira по jira_ticket_id
+  - Извлекает категорию из Jira (custom field, labels, components, issue type)
+  - Если категория отличается от predicted_type, обновляет actual_type в PostgreSQL
+  - Помечает тикет как training_ready, если decision='manual-review' и actual_type установлена
+  - Обновляет feedback_status='incorrect' и feedback_correct_type, если категория отличается
+- Errors: 500 (ошибка синхронизации), 404 (тикет не найден в БД)
+
+4.4 POST /sync/jira/batch — Пакетная синхронизация тикетов из Jira
+- Request
+  - jira_ticket_ids: string[] — список ключей тикетов в Jira
+  - category_field?: string — имя custom field для категории
+- Response (200)
+  - total: number — общее количество тикетов
+  - successful: number — успешно синхронизировано
+  - failed: number — не удалось синхронизировать
+  - details: SyncResultResponse[] — детали по каждому тикету
+
+4.5 POST /sync/jira/jql — Синхронизация тикетов по JQL запросу
+- Request
+  - jql: string — JQL запрос для поиска тикетов в Jira
+  - category_field?: string — имя custom field для категории
+  - max_results?: number (default: 100, max: 1000) — максимальное количество тикетов
+- Response (200): аналогично 4.4
+- Примеры JQL:
+  - "project = SD AND status = Resolved"
+  - "project = SD AND updated >= -7d"
+  - "project = SD AND labels = 'training-ready'"
+
+4.6 POST /sync/jira/all — Синхронизация всех тикетов с jira_ticket_id
+- Request
+  - category_field?: string — имя custom field для категории
+  - limit?: number (default: 100, max: 1000) — максимальное количество тикетов
+- Response (200): аналогично 4.4
+- Поведение:
+  - Находит все тикеты в БД, у которых есть jira_ticket_id
+  - Синхронизирует их с данными из Jira
+  - Сортирует по sent_to_jira_at DESC, затем по created_at DESC
+
+4.7 GET /jira/ticket/{jira_ticket_id} — Получить данные тикета из Jira
+- Path parameters
+  - jira_ticket_id: string — ключ тикета в Jira (например, SD-123)
+- Query parameters
+  - expand?: string — список полей для расширения (например, "fields,changelog")
+- Response (200)
+  - Данные тикета из Jira REST API (полный объект issue)
+  - Содержит fields, key, id, self и другие стандартные поля Jira API
+- Поведение:
+  - Получает данные тикета из Jira через REST API
+  - Не выполняет синхронизацию с PostgreSQL
+  - Используется для просмотра данных тикета без обновления БД
+- Errors: 404 (тикет не найден), 503 (Jira отключен), 500 (ошибка запроса)
+
+4.8 GET /jira/search — Поиск тикетов в Jira по JQL
+- Query parameters
+  - jql: string — JQL запрос (обязательный, например, "project = SD AND status = Resolved")
+  - fields?: string — список полей через запятую (например, "key,summary,status")
+  - max_results?: number (default: 50, max: 1000) — максимальное количество результатов
+  - start_at?: number (default: 0) — смещение для пагинации
+- Response (200)
+  - expand: string — расширенные поля
+  - startAt: number — смещение
+  - maxResults: number — максимальное количество результатов
+  - total: number — общее количество найденных тикетов
+  - issues: Array<Issue> — массив тикетов из Jira
+- Поведение:
+  - Выполняет поиск тикетов в Jira по JQL запросу
+  - Не выполняет синхронизацию с PostgreSQL
+  - Используется для просмотра и фильтрации тикетов в Jira
+- Примеры JQL:
+  - "project = SD AND status = Resolved"
+  - "project = SD AND updated >= -7d"
+  - "project = SD AND assignee = currentUser()"
+- Errors: 503 (Jira отключен), 500 (ошибка запроса)
+
 Коннекторы (ITicketDestination)
 - process_and_send(payload) -> (external_id, link, retry_count)
 - validate_connection()
@@ -307,7 +424,14 @@ Service Desk Classifier — API Reference
 Переменные окружения (Output)
 - DESTINATION_TYPE: 'filesystem'|'mock'|'jira' (default: 'filesystem')
 - OUTPUT_DIR: каталог для файлов (filesystem; default './out')
-- JIRA_URL, JIRA_USER, JIRA_API_TOKEN, JIRA_PROJECT_KEY — для jira-коннектора
+- Jira коннектор (стандартный API):
+  - JIRA_URL, JIRA_USER, JIRA_API_TOKEN, JIRA_PROJECT_KEY
+- Jira коннектор (Service Desk API):
+  - JIRA_USE_SERVICEDESK_API: 'true'|'false' (default: 'false') — использовать Service Desk API вместо стандартного
+  - JIRA_SERVICE_DESK_ID: ID Service Desk проекта (обязательно при JIRA_USE_SERVICEDESK_API=true)
+  - JIRA_REQUEST_TYPE_ID: ID типа запроса (Request Type) (обязательно при JIRA_USE_SERVICEDESK_API=true)
+  
+Примечание: Service Desk API (`/rest/servicedeskapi/request`) рекомендуется для работы с Jira Service Management проектами, так как учитывает специфику Service Desk (service projects, request types, SLA и т.д.). Стандартный API (`/rest/api/3/issue`) подходит для обычных Jira проектов.
 
 
 5) Dashboard (Port 8501)

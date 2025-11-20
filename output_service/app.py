@@ -17,7 +17,13 @@ from fastapi.responses import JSONResponse
 from .models import (
     ProcessResultRequest,
     ProcessResultResponse,
-    ErrorResponse
+    ErrorResponse,
+    SyncTicketRequest,
+    SyncBatchRequest,
+    SyncJQLRequest,
+    SyncAllRequest,
+    SyncResultResponse,
+    SyncBatchResponse
 )
 from .config import (
     API_HOST, API_PORT, LOG_LEVEL, MAX_RETRY_ATTEMPTS, RETRY_DELAY,
@@ -25,6 +31,7 @@ from .config import (
     JIRA_USER, JIRA_API_TOKEN
 )
 from .jira_client import JiraClient
+from .jira_sync import JiraSyncService
 from shared.database import get_db_cursor
 
 # Настройка логирования
@@ -36,6 +43,9 @@ logger = logging.getLogger(__name__)
 
 # Клиент Jira
 jira_client = JiraClient()
+
+# Сервис синхронизации с Jira
+jira_sync_service = JiraSyncService(jira_client)
 
 # ----------------------------
 # Destination Connectors
@@ -78,18 +88,104 @@ class FileSystemConnector(ITicketDestination):
             logger.error(f"FileSystemConnector validate failed: {e}")
             return False
 
+    def _normalize_text(self, text: Any) -> str:
+        """Нормализация текста для правильной кодировки UTF-8
+        
+        Исправляет проблему, когда UTF-8 текст был прочитан как Windows-1251
+        (например, "РЈ РјРµРЅСЏ" вместо "У меня")
+        
+        Алгоритм исправления:
+        1. Если текст содержит искаженные русские символы (типа "РЈ" вместо "У")
+        2. Это значит, что UTF-8 байты были интерпретированы как Windows-1251
+        3. Исправление: text.encode('latin1').decode('utf-8')
+           (latin1 сохраняет байты как есть, затем декодируем как UTF-8)
+        """
+        if text is None:
+            return ""
+        if not isinstance(text, str):
+            text = str(text)
+        
+        # Если текст пустой, возвращаем как есть
+        if not text:
+            return text
+        
+        # Проверяем, что текст может быть закодирован в UTF-8
+        try:
+            text.encode('utf-8')
+        except UnicodeEncodeError:
+            # Если не может быть закодирован, пытаемся исправить
+            try:
+                if isinstance(text, bytes):
+                    return text.decode('utf-8', errors='replace')
+                return text.encode('latin1').decode('utf-8', errors='replace')
+            except:
+                return text.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
+        
+        # Проверяем на признаки двойного кодирования (UTF-8 прочитан как Windows-1251)
+        # Характерные признаки: последовательности типа "РЈ", "РјРµ", "РЅСЏ" и т.д.
+        # Это байты UTF-8 русских букв, интерпретированные как Windows-1251
+        try:
+            # Если текст содержит символы вне ASCII, проверяем на искажение
+            if any(ord(c) > 127 for c in text):
+                # Пробуем исправить: encode('latin1') сохраняет байты как есть,
+                # затем decode('utf-8') правильно декодирует UTF-8
+                fixed = text.encode('latin1').decode('utf-8', errors='replace')
+                
+                # Проверяем, что исправленный текст содержит нормальные русские буквы
+                # (кириллица в диапазоне 0x0400-0x04FF)
+                has_cyrillic = any('\u0400' <= c <= '\u04FF' for c in fixed)
+                original_has_cyrillic = any('\u0400' <= c <= '\u04FF' for c in text)
+                
+                # Если исправленный текст содержит кириллицу, а оригинальный нет,
+                # значит исправление помогло
+                if has_cyrillic and not original_has_cyrillic:
+                    return fixed
+                # Если оба содержат кириллицу, но исправленный выглядит лучше
+                # (меньше искаженных символов), используем исправленный
+                elif has_cyrillic and original_has_cyrillic:
+                    # Подсчитываем количество нормальных русских букв
+                    fixed_cyrillic_count = sum(1 for c in fixed if '\u0400' <= c <= '\u04FF')
+                    original_cyrillic_count = sum(1 for c in text if '\u0400' <= c <= '\u04FF')
+                    if fixed_cyrillic_count > original_cyrillic_count:
+                        return fixed
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+        
+        return text
+
+    def _normalize_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Нормализация всех строковых полей в payload для правильной кодировки"""
+        normalized = {}
+        for key, value in payload.items():
+            if isinstance(value, str):
+                normalized[key] = self._normalize_text(value)
+            elif isinstance(value, dict):
+                normalized[key] = self._normalize_payload(value)
+            elif isinstance(value, list):
+                normalized[key] = [
+                    self._normalize_text(item) if isinstance(item, str) else item
+                    for item in value
+                ]
+            else:
+                normalized[key] = value
+        return normalized
+
     async def process_and_send(self, payload: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], int]:
         ticket_id = payload.get("ticket_id") or f"tick_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
         ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
         file_name = f"{ticket_id}_{ts}.json"
         file_path = self.base_dir / file_name
         try:
-            file_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            # Нормализуем payload перед записью
+            normalized_payload = self._normalize_payload(payload)
+            # Записываем JSON с правильной кодировкой UTF-8
+            json_str = json.dumps(normalized_payload, ensure_ascii=False, indent=2)
+            file_path.write_text(json_str, encoding="utf-8")
             external_id = f"FS-{ts}"
             link = str(file_path.resolve())
             return external_id, link, 0
         except Exception as e:
-            logger.error(f"FileSystemConnector write error: {e}")
+            logger.error(f"FileSystemConnector write error: {e}", exc_info=True)
             return None, None, 0
 
 
@@ -442,11 +538,16 @@ async def process_result(request: ProcessResultRequest) -> ProcessResultResponse
         
         # Отправка в выбранное назначение при auto-process
         if request.decision == "auto-process":
-            summary = f"[{request.predicted_type}] {request.text[:100]}"
+            # Нормализуем текст для правильной кодировки
+            # (FileSystemConnector будет дополнительно нормализовать, но лучше сделать это заранее)
+            normalized_text = request.text
+            normalized_predicted_type = request.predicted_type
+            
+            summary = f"[{normalized_predicted_type}] {normalized_text[:100]}"
             description = f"""
-Текст обращения: {request.text}
+Текст обращения: {normalized_text}
 
-Предсказанный тип: {request.predicted_type}
+Предсказанный тип: {normalized_predicted_type}
 Уверенность: {request.confidence:.2%}
 Версия модели: {request.model_version}
 Решение: {request.decision}
@@ -463,7 +564,7 @@ async def process_result(request: ProcessResultRequest) -> ProcessResultResponse
                 "summary": summary,
                 "description": description,
                 "priority": priority,
-                "predicted_type": request.predicted_type,
+                "predicted_type": normalized_predicted_type,
                 "confidence": request.confidence,
                 "model_version": request.model_version,
                 "decision": request.decision,
@@ -653,6 +754,237 @@ async def health_check():
             "jira_enabled": jira_client.enabled
         }
     )
+
+
+# ============================================================================
+# Endpoints для синхронизации данных из Jira
+# ============================================================================
+
+@app.post(
+    "/sync/jira/ticket",
+    response_model=SyncResultResponse,
+    tags=["Jira Sync"],
+    summary="Синхронизация одного тикета из Jira",
+    description="Получает данные тикета из Jira и обновляет поля actual_type, feedback_status в PostgreSQL"
+)
+async def sync_ticket_from_jira(request: SyncTicketRequest) -> SyncResultResponse:
+    """
+    Синхронизация одного тикета из Jira
+    
+    - Получает данные тикета из Jira по jira_ticket_id
+    - Извлекает категорию из Jira (custom field, labels, components и т.д.)
+    - Обновляет actual_type в PostgreSQL, если категория отличается от predicted_type
+    - Помечает тикет как training_ready, если decision='manual-review'
+    """
+    try:
+        result = await jira_sync_service.sync_ticket_from_jira(
+            jira_ticket_id=request.jira_ticket_id,
+            ticket_id=request.ticket_id,
+            category_field=request.category_field
+        )
+        
+        return SyncResultResponse(**result)
+        
+    except Exception as e:
+        logger.error(f"Ошибка при синхронизации тикета: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Ошибка при синхронизации тикета: {str(e)}"
+        )
+
+
+@app.post(
+    "/sync/jira/batch",
+    response_model=SyncBatchResponse,
+    tags=["Jira Sync"],
+    summary="Пакетная синхронизация тикетов из Jira",
+    description="Синхронизирует несколько тикетов из Jira"
+)
+async def sync_batch_from_jira(request: SyncBatchRequest) -> SyncBatchResponse:
+    """Пакетная синхронизация тикетов из Jira"""
+    try:
+        result = await jira_sync_service.sync_multiple_tickets(
+            jira_ticket_ids=request.jira_ticket_ids,
+            category_field=request.category_field
+        )
+        
+        return SyncBatchResponse(**result)
+        
+    except Exception as e:
+        logger.error(f"Ошибка при пакетной синхронизации: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Ошибка при пакетной синхронизации: {str(e)}"
+        )
+
+
+@app.post(
+    "/sync/jira/jql",
+    response_model=SyncBatchResponse,
+    tags=["Jira Sync"],
+    summary="Синхронизация тикетов по JQL запросу",
+    description="Ищет тикеты в Jira по JQL запросу и синхронизирует их с PostgreSQL"
+)
+async def sync_jql_from_jira(request: SyncJQLRequest) -> SyncBatchResponse:
+    """
+    Синхронизация тикетов по JQL запросу
+    
+    Примеры JQL:
+    - "project = SD AND status = Resolved"
+    - "project = SD AND updated >= -7d"
+    - "project = SD AND labels = 'training-ready'"
+    """
+    try:
+        result = await jira_sync_service.sync_tickets_by_jql(
+            jql=request.jql,
+            category_field=request.category_field,
+            max_results=request.max_results
+        )
+        
+        return SyncBatchResponse(**result)
+        
+    except Exception as e:
+        logger.error(f"Ошибка при синхронизации по JQL: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Ошибка при синхронизации по JQL: {str(e)}"
+        )
+
+
+@app.post(
+    "/sync/jira/all",
+    response_model=SyncBatchResponse,
+    tags=["Jira Sync"],
+    summary="Синхронизация всех тикетов с jira_ticket_id",
+    description="Синхронизирует все тикеты из БД, у которых есть jira_ticket_id"
+)
+async def sync_all_from_jira(request: SyncAllRequest) -> SyncBatchResponse:
+    """Синхронизация всех тикетов с jira_ticket_id"""
+    try:
+        result = await jira_sync_service.sync_tickets_with_jira_ids(
+            category_field=request.category_field,
+            limit=request.limit
+        )
+        
+        return SyncBatchResponse(**result)
+        
+    except Exception as e:
+        logger.error(f"Ошибка при синхронизации всех тикетов: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Ошибка при синхронизации всех тикетов: {str(e)}"
+        )
+
+
+# ============================================================================
+# Endpoints для получения данных из Jira (без синхронизации)
+# ============================================================================
+
+@app.get(
+    "/jira/ticket/{jira_ticket_id}",
+    tags=["Jira"],
+    summary="Получить данные тикета из Jira",
+    description="Получает данные тикета из Jira без синхронизации с PostgreSQL"
+)
+async def get_jira_ticket(
+    jira_ticket_id: str,
+    expand: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Получение данных тикета из Jira
+    
+    Args:
+        jira_ticket_id: Ключ тикета в Jira (например, SD-123)
+        expand: Список полей для расширения (например, "fields,changelog")
+    
+    Returns:
+        Данные тикета из Jira API
+    """
+    if not jira_client.enabled:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Jira клиент отключен или не настроен"
+        )
+    
+    try:
+        issue_data = await jira_client.get_issue(jira_ticket_id, expand=expand)
+        
+        if not issue_data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Тикет {jira_ticket_id} не найден в Jira или нет доступа"
+            )
+        
+        return issue_data
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Ошибка при получении тикета из Jira: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Ошибка при получении тикета из Jira: {str(e)}"
+        )
+
+
+@app.get(
+    "/jira/search",
+    tags=["Jira"],
+    summary="Поиск тикетов в Jira по JQL",
+    description="Выполняет поиск тикетов в Jira по JQL запросу без синхронизации"
+)
+async def search_jira_tickets(
+    jql: str,
+    fields: Optional[str] = None,
+    max_results: int = 50,
+    start_at: int = 0
+) -> Dict[str, Any]:
+    """
+    Поиск тикетов в Jira по JQL запросу
+    
+    Args:
+        jql: JQL запрос (например, "project = SD AND status = Resolved")
+        fields: Список полей через запятую (например, "key,summary,status")
+        max_results: Максимальное количество результатов (default: 50, max: 1000)
+        start_at: Смещение для пагинации (default: 0)
+    
+    Returns:
+        Результаты поиска из Jira API
+    """
+    if not jira_client.enabled:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Jira клиент отключен или не настроен"
+        )
+    
+    if max_results > 1000:
+        max_results = 1000
+    
+    try:
+        fields_list = fields.split(",") if fields else None
+        search_result = await jira_client.search_issues(
+            jql=jql,
+            fields=fields_list,
+            max_results=max_results,
+            start_at=start_at
+        )
+        
+        if not search_result:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Не удалось выполнить поиск в Jira"
+            )
+        
+        return search_result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Ошибка при поиске тикетов в Jira: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Ошибка при поиске тикетов в Jira: {str(e)}"
+        )
 
 
 if __name__ == "__main__":

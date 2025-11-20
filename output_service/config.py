@@ -21,6 +21,13 @@ JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN", "")
 JIRA_PROJECT_KEY = os.getenv("JIRA_PROJECT_KEY", "SD")
 JIRA_ENABLED = os.getenv("JIRA_ENABLED", "true").lower() == "true"
 
+# Настройки Jira Service Desk API
+# Если True - использует /rest/servicedeskapi/request (Service Desk API)
+# Если False - использует /rest/api/3/issue (стандартный Jira API)
+JIRA_USE_SERVICEDESK_API = os.getenv("JIRA_USE_SERVICEDESK_API", "false").lower() == "true"
+JIRA_SERVICE_DESK_ID = os.getenv("JIRA_SERVICE_DESK_ID", "")  # ID Service Desk проекта
+JIRA_REQUEST_TYPE_ID = os.getenv("JIRA_REQUEST_TYPE_ID", "")  # ID типа запроса (Request Type)
+
 # Настройки retry
 MAX_RETRY_ATTEMPTS = int(os.getenv("MAX_RETRY_ATTEMPTS", "3"))
 RETRY_DELAY = int(os.getenv("RETRY_DELAY", "5"))  # секунды
