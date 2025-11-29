@@ -1,0 +1,19 @@
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+
+scikit-learn==1.7.2  # Версия, использованная при обучении модели
+joblib==1.3.2
+numpy==2.2.2  # Совместимая версия numpy 2.x (модель обучена на 2.3.2, но 2.2.2 совместима для загрузки)
+scipy==1.14.1  # Обновлено для совместимости с numpy 2.x
+pandas==2.2.3  # Обновлено для совместимости с numpy 2.x
+
+pymorphy3==1.2.0
+nltk==3.8.1
+
+python-multipart==0.0.6
+
+# Установить общие зависимости (PostgreSQL, Redis)
+-r ../shared/requirements.txt
+
+httpx==0.25.1
