@@ -46,16 +46,59 @@ def init_pool(minconn: int = 1, maxconn: int = 10):
 def get_db_connection():
     """Контекстный менеджер для получения соединения с БД"""
     pool = init_pool()
-    conn = pool.getconn()
+    conn = None
     try:
+        conn = pool.getconn()
+        # Проверяем, что соединение действительно открыто
+        if conn.closed:
+            # Соединение закрыто - получаем новое
+            pool.putconn(conn, close=True)
+            conn = pool.getconn()
         yield conn
-        conn.commit()
+        if conn and not conn.closed:
+            conn.commit()
+    except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+        # Ошибка соединения - соединение закрыто сервером
+        logger.error(f"Ошибка соединения с БД: {e}")
+        # Закрываем соединение и возвращаем в пул с флагом close=True
+        if conn:
+            try:
+                if not conn.closed:
+                    try:
+                        conn.rollback()
+                    except:
+                        pass  # Игнорируем ошибки при rollback
+                pool.putconn(conn, close=True)  # Закрываем поврежденное соединение
+            except Exception as put_error:
+                logger.warning(f"Ошибка при возврате соединения в пул: {put_error}")
+        conn = None
+        raise
     except Exception as e:
-        conn.rollback()
+        # Другие ошибки - пытаемся rollback только если соединение открыто
+        if conn and not conn.closed:
+            try:
+                conn.rollback()
+            except (psycopg2.OperationalError, psycopg2.InterfaceError):
+                # Соединение закрыто во время rollback - закрываем его
+                logger.warning("Соединение закрыто во время rollback")
+                try:
+                    pool.putconn(conn, close=True)
+                except:
+                    pass
+                conn = None
         logger.error(f"Ошибка при работе с БД: {e}")
         raise
     finally:
-        pool.putconn(conn)
+        # Возвращаем соединение в пул только если оно еще открыто
+        if conn:
+            try:
+                if not conn.closed:
+                    pool.putconn(conn)
+                else:
+                    # Соединение закрыто - закрываем его явно
+                    pool.putconn(conn, close=True)
+            except Exception as put_error:
+                logger.warning(f"Ошибка при возврате соединения в пул в finally: {put_error}")
 
 
 @contextmanager

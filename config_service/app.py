@@ -176,8 +176,28 @@ async def root():
     "/config",
     response_model=ConfigResponse,
     tags=["Configuration"],
-    summary="Получить текущую конфигурацию",
-    description="Возвращает текущую конфигурацию системы"
+    summary="Текущая конфигурация",
+    description="""Получение текущей конфигурации системы.
+    
+**Response (200):**
+- auto_classification_enabled: включена ли автоклассификация
+- service_enabled: включен ли сервис
+- confidence_threshold: порог уверенности для auto-process (0..1)
+- model_version: версия модели (устаревшее, используйте current_model_version)
+- current_model_version: текущая активная версия модели
+- jira_integration_enabled: включена ли интеграция с Jira
+- jira_enabled: включена ли интеграция с Jira (алиас)
+- jira_project_key: ключ проекта Jira (опционально)
+- auto_process_priority: приоритет для auto-process ('low'|'medium'|'high'|'critical')
+- manual_review_priority: приоритет для manual-review ('low'|'medium'|'high'|'critical')
+- max_retry_attempts: максимальное количество попыток повтора
+- retry_delay_seconds: задержка между попытками в секундах (опционально)
+- timeout_seconds: таймаут операций в секундах (опционально)
+- batch_processing_enabled: включена ли пакетная обработка (опционально)
+- batch_size: размер пакета (опционально)
+- updated_at: время последнего обновления (ISO datetime, опционально)
+- updated_by: кто обновил конфигурацию (опционально)
+- all_config: полный объект конфигурации (опционально)"""
 )
 async def get_config() -> ConfigResponse:
     """Получение текущей конфигурации"""
@@ -236,7 +256,22 @@ async def get_config() -> ConfigResponse:
     response_model=ToggleResponse,
     tags=["Configuration"],
     summary="Включить/отключить автоклассификацию",
-    description="Включает или отключает сервис автоматической классификации"
+    description="""Включение или отключение сервиса автоматической классификации.
+    
+**Request:**
+- enabled: включить (true) или отключить (false) автоклассификацию
+- reason: причина изменения (опционально)
+
+**Response (200):**
+- auto_classification_enabled: новое состояние автоклассификации
+- service_enabled: новое состояние сервиса
+- message: сообщение о результате
+- updated_at: время обновления (ISO datetime)
+
+**Поведение:**
+- Обновляет значение service_enabled в конфигурации
+- Записывает изменение в audit log
+- При отключении новые тикеты не будут обрабатываться"""
 )
 async def toggle_service(request: ToggleRequest) -> ToggleResponse:
     """Включение/отключение сервиса"""
@@ -276,8 +311,32 @@ async def toggle_service(request: ToggleRequest) -> ToggleResponse:
     "/config/model-version",
     response_model=ModelSwitchResponse,
     tags=["Configuration"],
-    summary="Переключить версию модели",
-    description="Переключает активную версию модели с поддержкой gradual rollout"
+    summary="Переключение версии модели",
+    description="""Переключение активной версии модели с поддержкой gradual rollout.
+    
+**Request:**
+- version: версия модели для переключения (обязательно)
+- gradual_rollout: использовать постепенное развертывание (опционально, default: false)
+- rollout_percentage: процент трафика для новой версии (опционально, 0..100)
+
+**Response (200):**
+- model_version: версия модели
+- current_model_version: текущая активная версия модели
+- message: сообщение о результате
+- previous_version: предыдущая версия (опционально)
+- switched_at: время переключения (ISO datetime)
+- active_models: активные модели с распределением трафика в % (опционально)
+
+**Поведение:**
+- Проверяет существование версии модели в БД
+- Обновляет current_model_version в конфигурации
+- Обновляет флаг is_active в model_versions
+- Поддерживает gradual rollout для плавного перехода
+- Записывает изменение в audit log
+
+**Ошибки:**
+- 404: модель версии не найдена
+- 500: ошибка при переключении"""
 )
 async def switch_model(request: ModelSwitchRequest) -> ModelSwitchResponse:
     """Переключение версии модели"""
@@ -357,8 +416,10 @@ async def switch_model(request: ModelSwitchRequest) -> ModelSwitchResponse:
     "/config/model-switch",
     response_model=ModelSwitchResponse,
     tags=["Configuration"],
-    summary="Переключить версию модели (алиас)",
-    description="Алиас для /config/model-version"
+    summary="Переключение версии модели (алиас)",
+    description="""Алиас для POST /config/model-version.
+    
+**Request/Response:** аналогично POST /config/model-version"""
 )
 async def switch_model_alias(request: ModelSwitchRequest) -> ModelSwitchResponse:
     """Алиас для switch_model"""
@@ -369,8 +430,29 @@ async def switch_model_alias(request: ModelSwitchRequest) -> ModelSwitchResponse
     "/config/threshold",
     response_model=ThresholdResponse,
     tags=["Configuration"],
-    summary="Изменить порог уверенности",
-    description="Изменяет порог уверенности для auto-process"
+    summary="Изменение порога уверенности",
+    description="""Изменение порога уверенности для принятия решения auto-process.
+    
+**Request:**
+- threshold: новый порог уверенности (0..1, обязательно)
+- apply_retroactive: применить ретроактивно к существующим тикетам (опционально, default: false)
+
+**Response (200):**
+- confidence_threshold: новый порог уверенности
+- previous_threshold: предыдущий порог (опционально)
+- message: сообщение о результате
+- affected_tickets: количество затронутых тикетов (если apply_retroactive=true, опционально)
+- updated_at: время обновления (ISO datetime)
+
+**Поведение:**
+- Обновляет confidence_threshold в конфигурации
+- При apply_retroactive=true может переклассифицировать существующие тикеты (фоновая задача)
+- Записывает изменение в audit log
+- ML Service использует новый порог для определения decision (auto-process vs manual-review)
+
+**Примеры:**
+- threshold=0.70 → тикеты с confidence >= 0.70 → auto-process
+- threshold=0.95 → только очень уверенные тикеты → auto-process"""
 )
 async def set_threshold(request: ThresholdRequest) -> ThresholdResponse:
     """Изменение порога уверенности"""
@@ -419,8 +501,31 @@ async def set_threshold(request: ThresholdRequest) -> ThresholdResponse:
     "/config/jira",
     response_model=JiraConfigResponse,
     tags=["Configuration"],
-    summary="Настроить Jira интеграцию",
-    description="Настраивает интеграцию с Jira REST API"
+    summary="Настройка Jira",
+    description="""Настройка интеграции с Jira REST API.
+    
+**Request:**
+- jira_url: URL Jira сервера (обязательно)
+- jira_user: имя пользователя Jira (обязательно)
+- jira_api_token: API токен Jira (обязательно)
+- jira_project_key: ключ проекта Jira (обязательно)
+- custom_field_mapping: маппинг кастомных полей (опционально, Record<string,string>)
+
+**Response (200):**
+- status: 'configured' - статус настройки
+- connection_test: 'successful' | 'failed' - результат теста подключения
+- project_key: ключ проекта Jira
+- available_issue_types: доступные типы задач (опционально, string[])
+
+**Поведение:**
+- Тестирует подключение к Jira перед сохранением конфигурации
+- Получает доступные типы задач проекта
+- Сохраняет конфигурацию в БД
+- Записывает изменение в audit log
+
+**Ошибки:**
+- 503: не удалось подключиться к Jira (проверьте URL, credentials, доступность)
+- 500: ошибка при настройке"""
 )
 async def configure_jira(request: JiraConfigRequest) -> JiraConfigResponse:
     """Настройка Jira интеграции"""
@@ -492,7 +597,21 @@ async def configure_jira(request: JiraConfigRequest) -> JiraConfigResponse:
     response_model=ConfigAuditResponse,
     tags=["Configuration"],
     summary="История изменений конфигурации",
-    description="Возвращает историю изменений конфигурации системы"
+    description="""Получение истории изменений конфигурации системы.
+    
+**Query параметры:**
+- limit: количество результатов (default: 50, min: 1, max: 1000)
+- offset: смещение для пагинации (default: 0, min: 0)
+- changed_field: фильтр по полю (опционально)
+
+**Response (200):**
+- changes: массив изменений [{ id, field, old_value?, new_value?, changed_by, reason?, changed_at }]
+- total: общее количество изменений
+
+**Использование:**
+- Аудит всех изменений конфигурации
+- Отслеживание того, кто и когда вносил изменения
+- Фильтрация по конкретному полю для анализа истории"""
 )
 async def get_config_audit(
     limit: int = Query(50, ge=1, le=1000, description="Количество результатов"),
@@ -553,9 +672,19 @@ async def get_config_audit(
         )
 
 
-@app.get("/health", tags=["Health"])
+@app.get(
+    "/health",
+    tags=["Health"],
+    summary="Healthcheck",
+    description="""Проверка работоспособности сервиса (Config).
+    
+**Response (200|503):**
+- status: 'healthy' | 'unhealthy'
+- postgresql: 'connected' | 'disconnected' - статус подключения к PostgreSQL
+
+**Статус 503:** возвращается, если PostgreSQL недоступен"""
+)
 async def health_check():
-    """Проверка работоспособности сервиса"""
     try:
         from shared.database import get_db_connection
         with get_db_connection():

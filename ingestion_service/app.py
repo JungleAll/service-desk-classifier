@@ -114,8 +114,34 @@ async def root():
     response_model=TicketResponse,
     status_code=status.HTTP_201_CREATED,
     tags=["Tickets"],
-    summary="Создание нового обращения",
-    description="Принимает обращение и ставит его в очередь на обработку"
+    summary="Создать обращение",
+    description="""Создание нового обращения и постановка в очередь на обработку.
+    
+**Request:**
+- text: текст обращения (минимум 3 символа)
+- source: источник ('email' | 'chat' | 'api' | 'web')
+- user_id: ID пользователя (опционально)
+- email: email отправителя (опционально)
+- priority: приоритет ('low' | 'medium' | 'high' | 'critical', default: 'medium')
+- category_hint: подсказка о категории (опционально)
+- metadata: дополнительные метаданные (опционально)
+
+**Response (201 Created):**
+- ticket_id: уникальный ID обращения (формат 'tick_XXXXXXXX')
+- status: 'queued' - обращение поставлено в очередь
+- message: сообщение о результате
+- created_at: время создания (ISO datetime)
+- estimated_processing_time: оценка времени обработки в мс (default: 2000)
+
+**Поведение:**
+- Проверяет, включен ли сервис через Config Service
+- Сохраняет обращение в PostgreSQL
+- Добавляет в очередь Redis для обработки Worker'ом
+
+**Ошибки:**
+- 400: некорректные параметры (неверный source, priority, слишком короткий text)
+- 503: сервис отключен через Config Service
+- 500: внутренняя ошибка"""
 )
 async def create_ticket(request: TicketRequest) -> TicketResponse:
     """
@@ -211,8 +237,24 @@ async def create_ticket(request: TicketRequest) -> TicketResponse:
     "/tickets",
     response_model=TicketListResponse,
     tags=["Tickets"],
-    summary="Получить список обращений",
-    description="Возвращает список обращений с фильтрацией и пагинацией"
+    summary="Список обращений",
+    description="""Получение списка обращений с фильтрацией и пагинацией.
+    
+**Query параметры:**
+- limit: количество результатов (default: 50, min: 1, max: 1000)
+- offset: смещение для пагинации (default: 0, min: 0)
+- status: фильтр по статусу ('queued' | 'processing' | 'classified' | 'completed' | 'failed' | 'cancelled')
+- source: фильтр по источнику ('email' | 'chat' | 'api' | 'web')
+- priority: фильтр по приоритету ('low' | 'medium' | 'high' | 'critical')
+- date_from: фильтр с даты (YYYY-MM-DD)
+- date_to: фильтр по дату (YYYY-MM-DD)
+- sort: сортировка (default: "-created_at", префикс "-" для DESC, поля: created_at, updated_at, processed_at, status)
+
+**Response (200):**
+- tickets: массив объектов обращений
+- total: общее количество
+- page: текущая страница (вычисляется из offset/limit)
+- pages: всего страниц"""
 )
 async def get_tickets(
     limit: int = Query(50, ge=1, le=1000, description="Количество результатов"),
@@ -293,8 +335,33 @@ async def get_tickets(
     "/tickets/{ticket_id}",
     response_model=TicketDetailResponse,
     tags=["Tickets"],
-    summary="Получить детали обращения",
-    description="Возвращает полную информацию об обращении"
+    summary="Детали обращения",
+    description="""Получение полной информации об обращении.
+    
+**Response (200):**
+- ticket_id: ID обращения
+- text: текст обращения
+- source: источник
+- user_id: ID пользователя (опционально)
+- email: email отправителя (опционально)
+- priority: приоритет (опционально)
+- status: статус ('queued' | 'processing' | 'classified' | 'completed' | 'failed' | 'cancelled')
+- predicted_type: предсказанный тип (если классифицирован)
+- confidence: уверенность модели (если классифицирован)
+- probabilities: вероятности для всех классов в формате JSONB (если классифицирован)
+- decision: решение ('auto-process' | 'manual-review', если классифицирован)
+- model_version: версия модели, использованная для классификации
+- jira_issue_id: ID тикета в Jira или external_id (если отправлен)
+- jira_link: ссылка на тикет в Jira или путь к файлу (если отправлен)
+- created_at: время создания (ISO datetime)
+- processed_at: время завершения классификации (опционально)
+- sent_to_jira_at: время отправки в destination (опционально)
+- error_message: сообщение об ошибке (если есть)
+- retry_count: количество попыток
+
+**Ошибки:**
+- 404: обращение не найдено
+- 500: внутренняя ошибка"""
 )
 async def get_ticket_detail(ticket_id: str) -> TicketDetailResponse:
     """Получение деталей обращения"""
@@ -340,8 +407,38 @@ async def get_ticket_detail(ticket_id: str) -> TicketDetailResponse:
     "/status/{ticket_id}",
     response_model=TicketStatusResponse,
     tags=["Tickets"],
-    summary="Получить статус обработки",
-    description="Возвращает текущий статус и прогресс обработки обращения"
+    summary="Статус обработки",
+    description="""Получение текущего статуса и прогресса обработки обращения.
+    
+**Статусы:**
+- 'queued': тикет создан и поставлен в очередь
+- 'processing': тикет обрабатывается ML Service Worker
+- 'classified': классификация завершена, ожидает обработки Output Service
+- 'completed': полностью обработан (отправлен в destination)
+- 'failed': ошибка при обработке
+- 'cancelled': отменен пользователем
+
+**Response (200):**
+- ticket_id: ID обращения
+- status: текущий статус
+- progress: прогресс обработки в процентах (0..100)
+- steps: объект с шагами обработки (received, validated, queued, processing, classified, sent_to_jira, completed)
+- current_step: текущий шаг обработки (совпадает со status)
+- errors: массив ошибок (если есть)
+- retry_count: количество попыток
+- text: текст обращения (опционально)
+- source: источник (опционально)
+- predicted_type: предсказанный тип (если классифицирован)
+- confidence: уверенность модели (если классифицирован)
+- decision: решение ('auto-process' | 'manual-review', если классифицирован)
+- jira_ticket_id: ID тикета в Jira или external_id (если отправлен)
+- created_at: время создания (опционально)
+- processed_at: время завершения классификации (опционально)
+- error_message: сообщение об ошибке (если есть)
+
+**Ошибки:**
+- 404: обращение не найдено
+- 500: внутренняя ошибка"""
 )
 async def get_ticket_status(ticket_id: str) -> TicketStatusResponse:
     """Получение статуса обработки с прогрессом"""
@@ -398,8 +495,27 @@ async def get_ticket_status(ticket_id: str) -> TicketStatusResponse:
     "/tickets/{ticket_id}/cancel",
     response_model=CancelResponse,
     tags=["Tickets"],
-    summary="Отменить обработку обращения",
-    description="Отменяет обработку обращения, если оно еще не обработано"
+    summary="Отменить обработку",
+    description="""Отмена обработки обращения.
+    
+**Request:**
+- reason: причина отмены (обязательно)
+- comment: дополнительный комментарий (опционально)
+
+**Response (200):**
+- ticket_id: ID обращения
+- status: 'cancelled'
+- cancelled_at: время отмены (ISO datetime)
+
+**Поведение:**
+- Проверяет текущий статус тикета
+- Нельзя отменить, если статус 'completed' или 'cancelled'
+- Обновляет статус на 'cancelled' в БД
+
+**Ошибки:**
+- 404: обращение не найдено
+- 400: нельзя отменить (уже completed/cancelled)
+- 500: внутренняя ошибка"""
 )
 async def cancel_ticket(ticket_id: str, request: CancelRequest) -> CancelResponse:
     """Отмена обработки обращения"""
@@ -456,8 +572,30 @@ async def cancel_ticket(ticket_id: str, request: CancelRequest) -> CancelRespons
     response_model=ReprocessResponse,
     status_code=status.HTTP_202_ACCEPTED,
     tags=["Tickets"],
-    summary="Переоформить обращение",
-    description="Переоформляет обращение для повторной обработки"
+    summary="Переотправить в очередь",
+    description="""Переотправка обращения в очередь для повторной обработки.
+    
+**Request:**
+- text: опционально заменить исходный текст
+- force: принудительно переоформить даже если уже обработано (default: false)
+
+**Response (202 Accepted):**
+- ticket_id: ID обращения
+- status: 'queued_for_reprocessing' (в БД устанавливается 'queued')
+- previous_classification: предыдущая классификация predicted_type (если была)
+- requeued_at: время переотправки (ISO datetime)
+
+**Поведение:**
+- Проверяет текущий статус тикета
+- Если статус 'completed' и force=false → ошибка 400
+- Обновляет статус на 'queued' в БД
+- Опционально обновляет текст, если передан
+- Тикет будет обработан Worker'ом заново
+
+**Ошибки:**
+- 404: обращение не найдено
+- 400: нельзя переоформить без force (если уже completed)
+- 500: внутренняя ошибка"""
 )
 async def reprocess_ticket(ticket_id: str, request: ReprocessRequest) -> ReprocessResponse:
     """Переоформление обращения"""
@@ -530,8 +668,24 @@ async def reprocess_ticket(ticket_id: str, request: ReprocessRequest) -> Reproce
     response_model=BatchTicketResponse,
     status_code=status.HTTP_202_ACCEPTED,
     tags=["Tickets"],
-    summary="Загрузить пакет обращений",
-    description="Создает несколько обращений за один запрос"
+    summary="Пакетная загрузка",
+    description="""Пакетное создание обращений.
+    
+**Request:**
+- tickets: массив запросов на создание обращений (TicketRequest[])
+
+**Response (202 Accepted):**
+- batch_id: уникальный ID пакета
+- total: общее количество обращений в пакете
+- queued: количество успешно поставленных в очередь
+- failed: количество неудачных попыток
+- estimated_time: оценка времени обработки в миллисекундах
+
+**Поведение:**
+- Проверяет, включен ли сервис через Config Service
+- Обрабатывает каждое обращение из пакета
+- Сохраняет в БД и добавляет в очередь Redis
+- Возвращает статистику по успешным и неудачным попыткам"""
 )
 async def create_batch_tickets(request: BatchTicketRequest) -> BatchTicketResponse:
     """Пакетное создание обращений"""
@@ -610,9 +764,20 @@ async def create_batch_tickets(request: BatchTicketRequest) -> BatchTicketRespon
         )
 
 
-@app.get("/health", tags=["Health"])
+@app.get(
+    "/health",
+    tags=["Health"],
+    summary="Healthcheck",
+    description="""Проверка работоспособности сервиса (Ingestion).
+    
+**Response (200|503):**
+- status: 'healthy' | 'unhealthy'
+- redis: 'connected' | 'disconnected' - статус подключения к Redis (очередь)
+- postgresql: 'connected' | 'disconnected' - статус подключения к PostgreSQL
+
+**Статус 503:** возвращается, если Redis или PostgreSQL недоступны"""
+)
 async def health_check():
-    """Проверка работоспособности сервиса"""
     try:
         # Проверка подключения к Redis (очереди)
         from shared.redis_client import get_redis_queue_client

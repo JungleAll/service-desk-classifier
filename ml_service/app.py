@@ -185,7 +185,21 @@ async def root():
     status_code=status.HTTP_200_OK,
     tags=["Classification"],
     summary="Классифицировать текст",
-    description="Принимает текст обращения и возвращает предсказанный класс с вероятностями"
+    description="""Классификация текста обращения.
+    
+**Поведение:**
+- Проверяет кэш Redis DB 1 (ключ: cache_predictions:{version}:{hash})
+- Если кэш найден → возвращает результат из кэша (быстро)
+- Если кэш не найден:
+  - Проверяет версию модели из Config Service перед классификацией (автоперезагрузка при несоответствии)
+  - Выполняет классификацию через модель
+  - Сохраняет результат в кэш (TTL: 3600s)
+- Определяет decision на основе confidence_threshold из Config Service
+- Версия модели включается в ключ кэша, чтобы после переключения версии не использовать старые результаты
+
+**Ошибки:**
+- 400: Некорректный текст (минимум 3 символа)
+- 503: Модель не загружена или сервис недоступен"""
 )
 async def classify_text(request: ClassifyRequest) -> ClassifyResponse:
     """
@@ -335,7 +349,19 @@ async def classify_text(request: ClassifyRequest) -> ClassifyResponse:
     response_model=ModelStatusResponse,
     tags=["Model"],
     summary="Статус модели",
-    description="Возвращает информацию о загруженной модели"
+    description="""Возвращает информацию о загруженной модели.
+    
+**Возвращаемые поля:**
+- model_version: версия модели
+- model_name: название модели (опционально)
+- status: 'loaded' | 'not_loaded' (опционально)
+- is_loaded: загружена ли модель
+- num_classes: количество классов (опционально)
+- classes: список классов (опционально)
+- accuracy, precision, recall, f1_score: метрики модели (опционально)
+- loaded_at: время загрузки модели в ISO формате (опционально)
+- memory_usage_mb: использование памяти в МБ (опционально)
+- classifier_path, vectorizer_path, label_encoder_path: пути к файлам модели"""
 )
 async def get_model_status() -> ModelStatusResponse:
     """Получение информации о модели"""
@@ -394,7 +420,14 @@ async def get_model_status() -> ModelStatusResponse:
     response_model=BatchClassifyResponse,
     tags=["Classification"],
     summary="Классифицировать пакет текстов",
-    description="Классифицирует несколько текстов за один запрос"
+    description="""Пакетная классификация текстов.
+    
+**Request:** { texts: string[] } - массив текстов для классификации
+**Response:** 
+- results: массив результатов [{ text, predicted_type, confidence }]
+- total_time_ms: общее время обработки в миллисекундах
+
+**Примечание:** Тексты с длиной менее 3 символов пропускаются."""
 )
 async def classify_batch(request: BatchClassifyRequest) -> BatchClassifyResponse:
     """Пакетная классификация текстов"""
@@ -448,7 +481,11 @@ async def classify_batch(request: BatchClassifyRequest) -> BatchClassifyResponse
     response_model=ModelListResponse,
     tags=["Model"],
     summary="Список доступных моделей",
-    description="Возвращает список всех доступных версий моделей"
+    description="""Возвращает список всех доступных версий моделей из базы данных.
+    
+**Response:** 
+- models: массив моделей [{ version, name, accuracy?, is_active, created_at? }]
+- Модели отсортированы по дате создания (DESC)"""
 )
 async def get_model_list() -> ModelListResponse:
     """Получение списка доступных моделей"""
@@ -490,7 +527,20 @@ async def get_model_list() -> ModelListResponse:
     response_model=HealthResponse,
     tags=["Health"],
     summary="Healthcheck",
-    description="Проверка работоспособности сервиса с метриками"
+    description="""Проверка работоспособности сервиса с метриками.
+    
+**Response (200|503):**
+- status: 'healthy' | 'unhealthy'
+- model_loaded: загружена ли модель
+- model_version: версия модели (опционально)
+- uptime_seconds: время работы сервиса в секундах (опционально)
+- requests_total: общее количество запросов (опционально)
+- errors_total: общее количество ошибок (опционально)
+- avg_latency_ms: средняя задержка в мс (опционально)
+- message: дополнительное сообщение
+- reason: причина, если unhealthy (опционально)
+
+**Статус 503:** возвращается, если модель не загружена"""
 )
 async def health_check() -> HealthResponse:
     """Проверка здоровья сервиса с метриками"""
@@ -546,7 +596,20 @@ async def health_check() -> HealthResponse:
     response_model=ReloadResponse,
     tags=["Model"],
     summary="Перезагрузка модели",
-    description="Hot reload модели без остановки сервиса"
+    description="""Hot reload модели без остановки сервиса.
+    
+**Поведение:**
+- Обновляет версию модели из Config Service перед перезагрузкой
+- Выполняет перезагрузку модели в памяти
+- Не требует перезапуска сервиса
+
+**Response:**
+- success: успешна ли перезагрузка
+- message: сообщение о результате
+- model_version: версия модели после перезагрузки (опционально)
+
+**Ошибки:**
+- 503: если не удалось перезагрузить модель"""
 )
 async def reload_model() -> ReloadResponse:
     """Перезагрузка модели (hot reload)"""

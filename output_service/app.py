@@ -511,8 +511,45 @@ async def root():
     "/process_result",
     response_model=ProcessResultResponse,
     tags=["Processing"],
-    summary="Обработать результат классификации",
-    description="Обрабатывает результат классификации и отправляет в Jira"
+    summary="Обработка результата классификации",
+    description="""Обработка результата классификации и отправка в destination (Jira/FileSystem/Mock).
+    
+**Request:**
+- ticket_id: ID тикета (обязательно)
+- predicted_type: предсказанный тип (обязательно)
+- confidence: уверенность модели (0..1, обязательно)
+- decision: решение ('auto-process' | 'manual-review', обязательно)
+- model_version: версия модели (обязательно)
+- text: текст обращения (обязательно)
+- source: источник (опционально)
+- user_id: ID пользователя (опционально)
+- email: email отправителя (опционально)
+- priority: приоритет ('low'|'medium'|'high'|'critical', опционально)
+- probabilities: вероятности для всех классов (опционально, Record<string, number>)
+- metadata: дополнительные метаданные (опционально)
+
+**Response (200):**
+- success: успешно ли обработано
+- message: сообщение о результате
+- ticket_id: ID тикета
+- jira_ticket_id: external_id для всех коннекторов (Jira issue key, FileSystem filename, Mock ID)
+- jira_link: ссылка для Jira, путь к файлу для FileSystem, null для Mock
+- status: 'completed'
+- processed_at: время обработки (ISO datetime, опционально)
+- retry_count: количество попыток (опционально)
+
+**Поведение:**
+- Получает конфигурацию из Config Service API (GET /config) с fallback на БД
+- Определяет приоритет на основе decision:
+  - decision='auto-process' → auto_process_priority (default: 'medium')
+  - decision='manual-review' → manual_review_priority (default: 'low')
+- При decision='auto-process' — публикация в целевую систему через выбранный коннектор:
+  - DESTINATION_TYPE=jira → JiraConnector (создает тикет через Jira REST API или Service Desk API)
+  - DESTINATION_TYPE=filesystem → FileSystemConnector (сохраняет JSON в OUTPUT_DIR)
+  - DESTINATION_TYPE=mock → MockConnector (генерирует MOCK-{timestamp})
+- При decision='manual-review' — только обновление БД, без отправки
+- Обновляет запись в ticket_events (status='completed', external_id, link, priority, sent_to_jira_at)
+- Записывает в audit_logs (action, status, details, retry_count)"""
 )
 async def process_result(request: ProcessResultRequest) -> ProcessResultResponse:
     """
@@ -734,9 +771,20 @@ async def process_result(request: ProcessResultRequest) -> ProcessResultResponse
         )
 
 
-@app.get("/health", tags=["Health"])
+@app.get(
+    "/health",
+    tags=["Health"],
+    summary="Healthcheck",
+    description="""Проверка работоспособности сервиса (Output).
+    
+**Response (200|503):**
+- status: 'healthy' | 'unhealthy'
+- postgresql: 'connected' | 'disconnected' - статус подключения к PostgreSQL
+- jira_enabled: включена ли интеграция с Jira (boolean)
+
+**Статус 503:** возвращается, если PostgreSQL недоступен"""
+)
 async def health_check():
-    """Проверка работоспособности сервиса"""
     try:
         from shared.database import get_db_connection
         with get_db_connection():
@@ -765,7 +813,30 @@ async def health_check():
     response_model=SyncResultResponse,
     tags=["Jira Sync"],
     summary="Синхронизация одного тикета из Jira",
-    description="Получает данные тикета из Jira и обновляет поля actual_type, feedback_status в PostgreSQL"
+    description="""Синхронизация одного тикета из Jira с PostgreSQL.
+    
+**Request:**
+- jira_ticket_id: ключ тикета в Jira (например, SD-123, обязательно)
+- ticket_id: ID тикета в нашей системе (опционально, будет найден автоматически)
+- category_field: имя custom field для категории в Jira (опционально, например, "customfield_10001")
+
+**Response (200):**
+- success: успешно ли выполнена синхронизация
+- jira_ticket_id: ключ тикета в Jira
+- ticket_id: ID тикета в нашей системе (опционально)
+- updated_fields: список обновленных полей (actual_type, feedback_status, training_ready и т.д.)
+- errors: список ошибок при синхронизации
+
+**Поведение:**
+- Получает данные тикета из Jira по jira_ticket_id
+- Извлекает категорию из Jira (custom field, labels, components, issue type)
+- Если категория отличается от predicted_type, обновляет actual_type в PostgreSQL
+- Помечает тикет как training_ready, если decision='manual-review' и actual_type установлена
+- Обновляет feedback_status='incorrect' и feedback_correct_type, если категория отличается
+
+**Ошибки:**
+- 500: ошибка синхронизации
+- 404: тикет не найден в БД"""
 )
 async def sync_ticket_from_jira(request: SyncTicketRequest) -> SyncResultResponse:
     """
@@ -798,7 +869,22 @@ async def sync_ticket_from_jira(request: SyncTicketRequest) -> SyncResultRespons
     response_model=SyncBatchResponse,
     tags=["Jira Sync"],
     summary="Пакетная синхронизация тикетов из Jira",
-    description="Синхронизирует несколько тикетов из Jira"
+    description="""Пакетная синхронизация тикетов из Jira с PostgreSQL.
+    
+**Request:**
+- jira_ticket_ids: список ключей тикетов в Jira (обязательно, string[])
+- category_field: имя custom field для категории (опционально)
+
+**Response (200):**
+- total: общее количество тикетов
+- successful: успешно синхронизировано
+- failed: не удалось синхронизировать
+- details: детали по каждому тикету (SyncResultResponse[])
+
+**Поведение:**
+- Синхронизирует каждый тикет из списка
+- Возвращает статистику по успешным и неудачным синхронизациям
+- Детали по каждому тикету содержат информацию об обновленных полях"""
 )
 async def sync_batch_from_jira(request: SyncBatchRequest) -> SyncBatchResponse:
     """Пакетная синхронизация тикетов из Jira"""
@@ -823,7 +909,24 @@ async def sync_batch_from_jira(request: SyncBatchRequest) -> SyncBatchResponse:
     response_model=SyncBatchResponse,
     tags=["Jira Sync"],
     summary="Синхронизация тикетов по JQL запросу",
-    description="Ищет тикеты в Jira по JQL запросу и синхронизирует их с PostgreSQL"
+    description="""Синхронизация тикетов из Jira по JQL запросу.
+    
+**Request:**
+- jql: JQL запрос для поиска тикетов в Jira (обязательно)
+- category_field: имя custom field для категории (опционально)
+- max_results: максимальное количество тикетов (default: 100, max: 1000)
+
+**Response (200):** аналогично POST /sync/jira/batch
+
+**Примеры JQL:**
+- "project = SD AND status = Resolved"
+- "project = SD AND updated >= -7d"
+- "project = SD AND labels = 'training-ready'"
+
+**Поведение:**
+- Выполняет поиск тикетов в Jira по JQL запросу
+- Синхронизирует найденные тикеты с PostgreSQL
+- Возвращает статистику синхронизации"""
 )
 async def sync_jql_from_jira(request: SyncJQLRequest) -> SyncBatchResponse:
     """
@@ -856,7 +959,18 @@ async def sync_jql_from_jira(request: SyncJQLRequest) -> SyncBatchResponse:
     response_model=SyncBatchResponse,
     tags=["Jira Sync"],
     summary="Синхронизация всех тикетов с jira_ticket_id",
-    description="Синхронизирует все тикеты из БД, у которых есть jira_ticket_id"
+    description="""Синхронизация всех тикетов из БД, у которых есть jira_ticket_id.
+    
+**Request:**
+- category_field: имя custom field для категории (опционально)
+- limit: максимальное количество тикетов (default: 100, max: 1000)
+
+**Response (200):** аналогично POST /sync/jira/batch
+
+**Поведение:**
+- Находит все тикеты в БД, у которых есть jira_ticket_id
+- Синхронизирует их с данными из Jira
+- Сортирует по sent_to_jira_at DESC, затем по created_at DESC"""
 )
 async def sync_all_from_jira(request: SyncAllRequest) -> SyncBatchResponse:
     """Синхронизация всех тикетов с jira_ticket_id"""
@@ -884,7 +998,28 @@ async def sync_all_from_jira(request: SyncAllRequest) -> SyncBatchResponse:
     "/jira/ticket/{jira_ticket_id}",
     tags=["Jira"],
     summary="Получить данные тикета из Jira",
-    description="Получает данные тикета из Jira без синхронизации с PostgreSQL"
+    description="""Получение данных тикета из Jira без синхронизации с PostgreSQL.
+    
+**Path parameters:**
+- jira_ticket_id: ключ тикета в Jira (например, SD-123)
+
+**Query parameters:**
+- expand: список полей для расширения через запятую (опционально, например, "fields,changelog")
+
+**Response (200):**
+- Данные тикета из Jira REST API (полный объект issue)
+- Содержит fields, key, id, self и другие стандартные поля Jira API
+- Формат ответа соответствует Jira REST API v3
+
+**Поведение:**
+- Получает данные тикета из Jira через REST API
+- Не выполняет синхронизацию с PostgreSQL
+- Используется для просмотра данных тикета без обновления БД
+
+**Ошибки:**
+- 404: тикет не найден в Jira или нет доступа
+- 503: Jira клиент отключен или не настроен
+- 500: ошибка запроса к Jira"""
 )
 async def get_jira_ticket(
     jira_ticket_id: str,
@@ -931,7 +1066,35 @@ async def get_jira_ticket(
     "/jira/search",
     tags=["Jira"],
     summary="Поиск тикетов в Jira по JQL",
-    description="Выполняет поиск тикетов в Jira по JQL запросу без синхронизации"
+    description="""Поиск тикетов в Jira по JQL запросу без синхронизации с PostgreSQL.
+    
+**Query parameters:**
+- jql: JQL запрос (обязательный, например, "project = SD AND status = Resolved")
+- fields: список полей через запятую (опционально, например, "key,summary,status"). Если не указан, возвращаются все поля
+- max_results: максимальное количество результатов (default: 50, max: 1000)
+- start_at: смещение для пагинации (default: 0)
+
+**Response (200):**
+- expand: расширенные поля
+- startAt: смещение
+- maxResults: максимальное количество результатов
+- total: общее количество найденных тикетов
+- issues: массив тикетов из Jira (формат соответствует Jira REST API v3)
+
+**Поведение:**
+- Выполняет поиск тикетов в Jira по JQL запросу
+- Не выполняет синхронизацию с PostgreSQL
+- Используется для просмотра и фильтрации тикетов в Jira
+
+**Примеры JQL:**
+- "project = SD AND status = Resolved"
+- "project = SD AND updated >= -7d"
+- "project = SD AND assignee = currentUser()"
+- "project = SD AND labels = 'training-ready'"
+
+**Ошибки:**
+- 503: Jira клиент отключен или не настроен
+- 500: ошибка запроса к Jira или не удалось выполнить поиск"""
 )
 async def search_jira_tickets(
     jql: str,

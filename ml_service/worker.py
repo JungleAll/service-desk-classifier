@@ -7,6 +7,7 @@ import os
 import httpx
 from typing import Optional, Dict, Any
 from datetime import datetime
+import psycopg2
 
 from .classifier import ServiceDeskClassifier
 from .config import CONFIDENCE_THRESHOLD
@@ -54,39 +55,67 @@ async def process_ticket_from_queue(
     
     try:
         # Проверяем существование тикета в БД и его текущий статус
-        with get_db_cursor() as cursor:
-            cursor.execute("""
-                SELECT status FROM ticket_events WHERE ticket_id = %s
-            """, (ticket_id,))
-            ticket_info = cursor.fetchone()
-            
-            if not ticket_info:
-                logger.error(f"Тикет {ticket_id} не найден в БД, пропускаю обработку")
-                return False
-            
-            current_status = ticket_info['status']
-            
-            # Если тикет уже обработан или обрабатывается, пропускаем
-            if current_status in ['classified', 'completed', 'processing']:
-                logger.warning(f"Тикет {ticket_id} уже в статусе {current_status}, пропускаю обработку")
-                return False
-            
-            # Обновляем статус на "processing" только если статус был "queued"
-            if current_status != 'queued':
-                logger.warning(f"Тикет {ticket_id} в неожиданном статусе {current_status}, пропускаю обработку")
-                return False
-            
-            # Обновляем статус на "processing"
-            cursor.execute("""
-                UPDATE ticket_events
-                SET status = 'processing', updated_at = CURRENT_TIMESTAMP
-                WHERE ticket_id = %s AND status = 'queued'
-            """, (ticket_id,))
-            
-            # Проверяем, что обновление прошло успешно
-            if cursor.rowcount == 0:
-                logger.warning(f"Не удалось обновить статус тикета {ticket_id} на 'processing' (возможно, уже обработан)")
-                return False
+        # Добавляем retry для обработки ошибок соединения
+        max_retries = 3
+        retry_delay = 0.5
+        ticket_info = None
+        
+        for attempt in range(max_retries):
+            try:
+                with get_db_cursor() as cursor:
+                    cursor.execute("""
+                        SELECT status FROM ticket_events WHERE ticket_id = %s
+                    """, (ticket_id,))
+                    ticket_info = cursor.fetchone()
+                break  # Успешно получили данные
+            except (psycopg2.OperationalError, psycopg2.InterfaceError) as db_error:
+                if attempt < max_retries - 1:
+                    logger.warning(f"Ошибка соединения с БД при проверке тикета {ticket_id} (попытка {attempt + 1}/{max_retries}): {db_error}. Повтор через {retry_delay}с...")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2  # Экспоненциальная задержка
+                else:
+                    logger.error(f"Не удалось проверить тикет {ticket_id} после {max_retries} попыток: {db_error}")
+                    raise
+        
+        if not ticket_info:
+            logger.error(f"Тикет {ticket_id} не найден в БД, пропускаю обработку")
+            return False
+        
+        current_status = ticket_info['status']
+        
+        # Если тикет уже обработан или обрабатывается, пропускаем
+        if current_status in ['classified', 'completed', 'processing']:
+            logger.warning(f"Тикет {ticket_id} уже в статусе {current_status}, пропускаю обработку")
+            return False
+        
+        # Обновляем статус на "processing" только если статус был "queued"
+        if current_status != 'queued':
+            logger.warning(f"Тикет {ticket_id} в неожиданном статусе {current_status}, пропускаю обработку")
+            return False
+        
+        # Обновляем статус на "processing" с retry
+        for attempt in range(max_retries):
+            try:
+                with get_db_cursor() as cursor:
+                    cursor.execute("""
+                        UPDATE ticket_events
+                        SET status = 'processing', updated_at = CURRENT_TIMESTAMP
+                        WHERE ticket_id = %s AND status = 'queued'
+                    """, (ticket_id,))
+                    
+                    # Проверяем, что обновление прошло успешно
+                    if cursor.rowcount == 0:
+                        logger.warning(f"Не удалось обновить статус тикета {ticket_id} на 'processing' (возможно, уже обработан)")
+                        return False
+                break  # Успешно обновили
+            except (psycopg2.OperationalError, psycopg2.InterfaceError) as db_error:
+                if attempt < max_retries - 1:
+                    logger.warning(f"Ошибка соединения с БД при обновлении статуса тикета {ticket_id} (попытка {attempt + 1}/{max_retries}): {db_error}. Повтор через {retry_delay}с...")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2
+                else:
+                    logger.error(f"Не удалось обновить статус тикета {ticket_id} после {max_retries} попыток: {db_error}")
+                    raise
         
         logger.info(f"Обработка тикета {ticket_id}: {text[:50]}...")
         
