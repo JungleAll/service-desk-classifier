@@ -161,6 +161,9 @@ logs/
 *.joblib
 *.model
 
+# Models directory (should not be in version control)
+models/
+
 # Data files
 *.csv
 *.json
