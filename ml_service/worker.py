@@ -163,8 +163,32 @@ async def process_ticket_from_queue(
             }
         else:
             # Классификация
+            # Автоматическая попытка перезагрузки модели, если она не загружена
             if not classifier.is_loaded:
-                raise Exception("Модель не загружена")
+                logger.warning(f"Worker: Модель не загружена для тикета {ticket_id}. Попытка автоматической перезагрузки...")
+                try:
+                    # Получаем версию модели из Config Service перед перезагрузкой
+                    config_url = os.getenv("CONFIG_SERVICE_URL", "http://localhost:8002")
+                    try:
+                        async with httpx.AsyncClient(timeout=2.0) as client:
+                            resp = await client.get(f"{config_url}/config")
+                            if resp.status_code == 200:
+                                cfg = resp.json()
+                                desired_version = cfg.get("current_model_version")
+                                if desired_version:
+                                    os.environ["ML_MODEL_VERSION"] = desired_version
+                                    logger.info(f"Worker: Установлена версия модели из Config: {desired_version}")
+                    except Exception as e:
+                        logger.warning(f"Worker: Не удалось получить версию из Config перед перезагрузкой: {e}")
+                    
+                    # Попытка перезагрузки модели
+                    if classifier.reload_model():
+                        logger.info(f"Worker: ✅ Модель успешно перезагружена автоматически для тикета {ticket_id}")
+                    else:
+                        raise Exception("Модель не загружена и автоматическая перезагрузка не удалась. Проверьте наличие файлов модели в models/v1.0/")
+                except Exception as reload_error:
+                    logger.error(f"Worker: ❌ Не удалось перезагрузить модель для тикета {ticket_id}: {reload_error}")
+                    raise Exception(f"Модель не загружена: {str(reload_error)}")
             
             result = classifier.predict(text)
             
@@ -292,7 +316,18 @@ async def process_ticket_from_queue(
             return True
         
     except Exception as e:
-        logger.error(f"Ошибка при обработке тикета {ticket_id}: {e}", exc_info=True)
+        error_message = str(e)
+        logger.error(f"Ошибка при обработке тикета {ticket_id}: {error_message}", exc_info=True)
+        
+        # Улучшенное сообщение об ошибке для случая отсутствия модели
+        if "Модель не загружена" in error_message or "не загружена" in error_message.lower():
+            error_message = (
+                f"Модель не загружена. "
+                f"Проверьте наличие файлов модели в models/{classifier.model_version}/: "
+                f"classifier_smote_new.pkl, vectorizer_smote.pkl, label_encoder_smote.pkl. "
+                f"После добавления модели используйте POST /reload_model или перезапустите ML Service."
+            )
+            logger.error(f"Worker: Детали ошибки для тикета {ticket_id}: {error_message}")
         
         # Обновление статуса на failed
         try:
@@ -303,7 +338,7 @@ async def process_ticket_from_queue(
                         error_message = %s,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE ticket_id = %s
-                """, (str(e), ticket_id))
+                """, (error_message, ticket_id))
         except Exception as db_error:
             logger.error(f"Ошибка при обновлении статуса тикета {ticket_id} в БД: {db_error}")
         
@@ -337,11 +372,44 @@ async def queue_worker_loop(classifier: ServiceDeskClassifier):
         f"Worker запущен. Ожидание тикетов из очереди {QUEUE_PENDING_TICKETS} "
         f"(timeout={queue_poll_timeout}s, delay={worker_delay}s)"
     )
+    logger.info(f"Worker: Модель загружена: {classifier.is_loaded}, версия: {classifier.model_version}")
     
     _worker_running = True
+    # Счетчик итераций для периодической проверки модели (если не загружена)
+    _iteration_count = 0
+    _model_check_interval = 60  # Проверять модель каждые 60 итераций (примерно раз в 6 секунд при delay=0.1)
     
     while _worker_running:
         try:
+            # Периодическая проверка модели, если она не загружена (опционально)
+            if not classifier.is_loaded:
+                _iteration_count += 1
+                if _iteration_count >= _model_check_interval:
+                    _iteration_count = 0
+                    logger.info("Worker: Модель не загружена. Попытка автоматической перезагрузки...")
+                    try:
+                        # Получаем версию модели из Config Service перед перезагрузкой
+                        config_url = os.getenv("CONFIG_SERVICE_URL", "http://localhost:8002")
+                        try:
+                            async with httpx.AsyncClient(timeout=2.0) as client:
+                                resp = await client.get(f"{config_url}/config")
+                                if resp.status_code == 200:
+                                    cfg = resp.json()
+                                    desired_version = cfg.get("current_model_version")
+                                    if desired_version:
+                                        os.environ["ML_MODEL_VERSION"] = desired_version
+                                        logger.info(f"Worker: Установлена версия модели из Config: {desired_version}")
+                        except Exception as e:
+                            logger.debug(f"Worker: Не удалось получить версию из Config: {e}")
+                        
+                        # Попытка перезагрузки модели
+                        if classifier.reload_model():
+                            logger.info(f"Worker: ✅ Модель успешно перезагружена автоматически!")
+                        else:
+                            logger.debug(f"Worker: Модель все еще недоступна. Повторная проверка через {_model_check_interval} итераций.")
+                    except Exception as reload_error:
+                        logger.debug(f"Worker: Не удалось перезагрузить модель: {reload_error}")
+            
             # Получение тикета из очереди (блокирующий вызов с таймаутом)
             # Используем run_in_executor чтобы не блокировать event loop
             loop = asyncio.get_event_loop()
@@ -350,6 +418,8 @@ async def queue_worker_loop(classifier: ServiceDeskClassifier):
             ticket_data = await loop.run_in_executor(None, get_ticket)
             
             if ticket_data:
+                # Сбрасываем счетчик при получении тикета
+                _iteration_count = 0
                 ticket_id = ticket_data.get("ticket_id", "unknown")
                 logger.info(f"Worker: Получен тикет {ticket_id} из очереди, начинаю обработку...")
                 # Обработка тикета
@@ -392,7 +462,9 @@ def start_worker(classifier: ServiceDeskClassifier) -> Optional[asyncio.Task]:
     """
     global _worker_task, _worker_enabled
     
-    worker_enabled = os.getenv("WORKER_ENABLED", "false").lower() == "true"
+    # По умолчанию Worker включен для автоматической обработки тикетов
+    # Для отключения установите WORKER_ENABLED=false
+    worker_enabled = os.getenv("WORKER_ENABLED", "true").lower() == "true"
     
     if not worker_enabled:
         logger.info("Worker отключен (WORKER_ENABLED=false). Используйте REST API для классификации.")

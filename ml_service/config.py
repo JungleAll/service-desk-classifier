@@ -39,7 +39,9 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 MIN_TEXT_LENGTH = 3
 
 # Настройки Worker (асинхронная обработка очереди Redis)
-WORKER_ENABLED = os.getenv("WORKER_ENABLED", "false").lower() == "true"  # Включить/выключить worker
+# По умолчанию Worker включен для автоматической обработки тикетов из очереди
+# Для отключения установите WORKER_ENABLED=false
+WORKER_ENABLED = os.getenv("WORKER_ENABLED", "true").lower() == "true"  # Включить/выключить worker
 WORKER_QUEUE_TIMEOUT = int(os.getenv("WORKER_QUEUE_TIMEOUT", "5"))  # Таймаут ожидания тикета из очереди (секунды)
 WORKER_DELAY = float(os.getenv("WORKER_DELAY", "0.1"))  # Задержка между итерациями цикла (секунды)
 
