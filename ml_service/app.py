@@ -26,11 +26,20 @@ from .models import (
     ModelListItem,
     HealthResponse,
     ErrorResponse,
-    ReloadResponse
+    ReloadResponse,
+    WorkerDiagnosticsResponse
 )
-from .config import API_HOST, API_PORT, LOG_LEVEL, WORKER_ENABLED
+from .config import API_HOST, API_PORT, LOG_LEVEL, WORKER_ENABLED, CONFIDENCE_THRESHOLD
 from .worker import start_worker, stop_worker, is_worker_running
-from shared.redis_client import get_cache, set_cache, CACHE_PREDICTIONS
+from shared.redis_client import (
+    get_cache, 
+    set_cache, 
+    CACHE_PREDICTIONS,
+    get_queue_length,
+    QUEUE_PENDING_TICKETS,
+    QUEUE_FAILED_TICKETS,
+    get_redis_queue_client
+)
 from shared.database import get_db_cursor
 
 # Настройка логирования
@@ -273,12 +282,30 @@ async def classify_text(request: ClassifyRequest) -> ClassifyResponse:
             if request.top_n and len(probabilities_list) > request.top_n:
                 probabilities_list = probabilities_list[:request.top_n]
             
+            # Получение актуального порога уверенности из Config Service и переопределение decision
+            confidence_threshold = CONFIDENCE_THRESHOLD
+            try:
+                config_url = os.getenv("CONFIG_SERVICE_URL", "http://localhost:8002")
+                async with httpx.AsyncClient(timeout=2.0) as client:
+                    resp = await client.get(f"{config_url}/config")
+                    if resp.status_code == 200:
+                        cfg = resp.json()
+                        threshold = cfg.get("confidence_threshold")
+                        if threshold is not None:
+                            confidence_threshold = float(threshold)
+            except Exception as e:
+                logger.debug(f"Не удалось получить порог из Config Service, используем дефолтный: {e}")
+            
+            # Переопределение decision на основе актуального порога
+            cached_confidence = cached_result['confidence']
+            decision = "auto-process" if cached_confidence >= confidence_threshold else "manual-review"
+            
             return ClassifyResponse(
                 predicted_type=cached_result['predicted_type'],
-                confidence=cached_result['confidence'],
+                confidence=cached_confidence,
                 probabilities=probabilities_list if request.return_probabilities else [],
                 model_version=cached_result['model_version'],
-                decision=cached_result['decision'],
+                decision=decision,
                 processing_time_ms=processing_time
             )
         
@@ -299,13 +326,30 @@ async def classify_text(request: ClassifyRequest) -> ClassifyResponse:
         processing_time = int((time.time() - start_time) * 1000)
         _total_latency_ms += processing_time
         
-        # Сохранение в кэш
+        # Получение актуального порога уверенности из Config Service и переопределение decision
+        confidence_threshold = CONFIDENCE_THRESHOLD
+        try:
+            config_url = os.getenv("CONFIG_SERVICE_URL", "http://localhost:8002")
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                resp = await client.get(f"{config_url}/config")
+                if resp.status_code == 200:
+                    cfg = resp.json()
+                    threshold = cfg.get("confidence_threshold")
+                    if threshold is not None:
+                        confidence_threshold = float(threshold)
+        except Exception as e:
+            logger.debug(f"Не удалось получить порог из Config Service, используем дефолтный: {e}")
+        
+        # Переопределение decision на основе актуального порога
+        decision = "auto-process" if result['confidence'] >= confidence_threshold else "manual-review"
+        
+        # Сохранение в кэш (сохраняем decision с актуальным порогом)
         cache_data = {
             'predicted_type': result['predicted_type'],
             'confidence': result['confidence'],
             'probabilities': probabilities_dict,
             'model_version': result['model_version'],
-            'decision': result['decision']
+            'decision': decision
         }
         set_cache(cache_key, cache_data, ttl=3600)
         
@@ -325,7 +369,7 @@ async def classify_text(request: ClassifyRequest) -> ClassifyResponse:
             confidence=result['confidence'],
             probabilities=probabilities_list if request.return_probabilities else [],
             model_version=result['model_version'],
-            decision=result['decision'],
+            decision=decision,
             processing_time_ms=processing_time
         )
         
@@ -648,6 +692,92 @@ async def reload_model() -> ReloadResponse:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"Ошибка при перезагрузке модели: {str(e)}"
+        )
+
+
+@app.get(
+    "/worker/diagnostics",
+    response_model=WorkerDiagnosticsResponse,
+    tags=["Worker"],
+    summary="Диагностика Worker и очереди",
+    description="""Получение диагностической информации о Worker и очереди Redis.
+    
+**Возвращает:**
+- worker_enabled: включен ли Worker (WORKER_ENABLED)
+- worker_running: запущен ли Worker
+- model_loaded: загружена ли модель
+- queue_pending_length: количество тикетов в очереди pending_tickets
+- queue_failed_length: количество тикетов в очереди failed_tickets
+- redis_connected: подключен ли Redis
+- message: сообщение о статусе
+
+**Использование:**
+Проверьте этот endpoint, если тикеты не обрабатываются:
+1. Если worker_enabled=false → установите WORKER_ENABLED=true
+2. Если worker_running=false → проверьте логи ML Service
+3. Если queue_pending_length > 0 и worker_running=true → Worker не обрабатывает очередь
+4. Если redis_connected=false → проверьте подключение к Redis"""
+)
+async def worker_diagnostics() -> WorkerDiagnosticsResponse:
+    """Диагностика Worker и очереди"""
+    try:
+        # Проверка статуса Worker
+        worker_enabled = WORKER_ENABLED
+        worker_running = is_worker_running() if worker_enabled else False
+        model_loaded = classifier.is_loaded
+        
+        # Проверка подключения к Redis и длины очереди
+        redis_connected = False
+        pending_length = 0
+        failed_length = 0
+        
+        try:
+            client = get_redis_queue_client()
+            client.ping()
+            redis_connected = True
+            pending_length = get_queue_length(QUEUE_PENDING_TICKETS)
+            failed_length = get_queue_length(QUEUE_FAILED_TICKETS)
+        except Exception as e:
+            logger.warning(f"Не удалось подключиться к Redis для диагностики: {e}")
+            redis_connected = False
+        
+        # Формирование сообщения
+        messages = []
+        if not worker_enabled:
+            messages.append("Worker отключен (WORKER_ENABLED=false). Установите WORKER_ENABLED=true для автоматической обработки очереди.")
+        elif not worker_running:
+            messages.append("Worker включен, но не запущен. Проверьте логи ML Service.")
+        else:
+            messages.append("Worker запущен и работает.")
+        
+        if not model_loaded:
+            messages.append("Модель не загружена. Проверьте наличие файлов модели в models/v1.0/.")
+        
+        if not redis_connected:
+            messages.append("Redis недоступен. Проверьте подключение к Redis.")
+        
+        if pending_length > 0:
+            messages.append(f"В очереди {pending_length} тикет(ов) ожидают обработки.")
+        
+        if failed_length > 0:
+            messages.append(f"В очереди failed_tickets {failed_length} тикет(ов).")
+        
+        message = " ".join(messages) if messages else "Все системы работают нормально."
+        
+        return WorkerDiagnosticsResponse(
+            worker_enabled=worker_enabled,
+            worker_running=worker_running,
+            model_loaded=model_loaded,
+            queue_pending_length=pending_length,
+            queue_failed_length=failed_length,
+            redis_connected=redis_connected,
+            message=message
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при получении диагностики Worker: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Ошибка при получении диагностики: {str(e)}"
         )
 
 

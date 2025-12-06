@@ -135,3 +135,14 @@ class ReloadResponse(BaseModel):
     message: str = Field(..., description="Сообщение о результате")
     model_version: Optional[str] = Field(None, description="Версия модели после перезагрузки")
 
+
+class WorkerDiagnosticsResponse(BaseModel):
+    """Модель ответа для диагностики Worker и очереди"""
+    
+    worker_enabled: bool = Field(..., description="Включен ли Worker")
+    worker_running: bool = Field(..., description="Запущен ли Worker")
+    model_loaded: bool = Field(..., description="Загружена ли модель")
+    queue_pending_length: int = Field(..., description="Количество тикетов в очереди pending_tickets")
+    queue_failed_length: int = Field(..., description="Количество тикетов в очереди failed_tickets")
+    redis_connected: bool = Field(..., description="Подключен ли Redis")
+    message: str = Field(..., description="Сообщение о статусе")
