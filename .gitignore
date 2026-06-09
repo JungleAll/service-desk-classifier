@@ -47,6 +47,11 @@ Thumbs.db
 
 # Jupyter
 .ipynb_checkpoints/
+notebooks/
+
+# Internal dev and test tooling (not part of published platform)
+check_scripts/
+scripts/
 
 # Output files
 out/
