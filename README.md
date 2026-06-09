@@ -182,7 +182,7 @@ stateDiagram-v2
 ### Запуск через Docker Compose
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/JungleAll/service-desk-classifier.git
 cd service-desk-classifier
 docker compose up -d
 ```
