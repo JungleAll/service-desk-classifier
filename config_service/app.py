@@ -1,6 +1,5 @@
 """FastAPI приложение для Config Service (Port 8002)"""
 
-import logging
 from contextlib import asynccontextmanager
 from typing import Dict, Any, Optional
 
@@ -22,22 +21,39 @@ from .models import (
     ConfigAuditItem,
     ErrorResponse
 )
-from .config import API_HOST, API_PORT, LOG_LEVEL
+from .config import API_HOST, API_PORT, CONFIG_FALLBACK_ENABLED, CONFIG_SYNC_INTERVAL
+from .config_fallback import (
+    load_config_from_file,
+    save_config_to_file,
+    get_config_value_from_file,
+    get_all_config_from_file,
+    update_config_in_file,
+    sync_config_from_db,
+    get_config_file_info
+)
 from shared.database import get_db_cursor, execute_query
+from shared.logger import configure_service_logging
 from datetime import datetime
 from typing import List
 import httpx
+import asyncio
+import psycopg2
 
 # Настройка логирования
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL.upper()),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+logger = configure_service_logging("config")
+
+# Глобальные переменные для задачи синхронизации
+_sync_task: Optional[asyncio.Task] = None
+_sync_running = False
 
 
 def get_config_value(key: str, default: Any = None) -> Any:
-    """Получение значения конфигурации из БД"""
+    """
+    Получение значения конфигурации из БД с fallback на файл
+    
+    Сначала пытается получить из PostgreSQL, при недоступности использует файл fallback.
+    """
+    # Попытка получить из PostgreSQL
     try:
         with get_db_cursor() as cursor:
             cursor.execute("SELECT value FROM configuration WHERE key = %s", (key,))
@@ -57,44 +73,78 @@ def get_config_value(key: str, default: Any = None) -> Any:
                 except ValueError:
                     return value
             return default
+    except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+        # Ошибка подключения к БД - используем fallback
+        logger.warning(f"PostgreSQL недоступен, используем fallback для ключа {key}: {e}")
+        if CONFIG_FALLBACK_ENABLED:
+            value = get_config_value_from_file(key, default)
+            if value != default:
+                logger.info(f"Значение {key} получено из fallback файла: {value}")
+            return value
+        return default
     except Exception as e:
         logger.error(f"Ошибка при получении конфигурации {key}: {e}")
+        # При любой другой ошибке тоже пробуем fallback
+        if CONFIG_FALLBACK_ENABLED:
+            return get_config_value_from_file(key, default)
         return default
 
 
 def set_config_value(key: str, value: Any, updated_by: str = "system", reason: Optional[str] = None, old_value: Any = None) -> bool:
-    """Установка значения конфигурации в БД с логированием изменений"""
+    """
+    Установка значения конфигурации в БД с логированием изменений и обновлением fallback файла
+    """
     try:
         # Получение старого значения
         if old_value is None:
             old_value = get_config_value(key)
         
-        with get_db_cursor() as cursor:
-            cursor.execute("""
-                INSERT INTO configuration (key, value, updated_by)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (key) 
-                DO UPDATE SET value = EXCLUDED.value, 
-                              updated_at = CURRENT_TIMESTAMP,
-                              updated_by = EXCLUDED.updated_by
-            """, (key, str(value), updated_by))
-            
-            # Логирование изменения
-            if old_value != value:
+        db_success = False
+        try:
+            with get_db_cursor() as cursor:
                 cursor.execute("""
-                    INSERT INTO config_audit_log (field, old_value, new_value, changed_by, reason)
-                    VALUES (%s, %s, %s, %s, %s)
-                """, (key, str(old_value) if old_value is not None else None, str(value), updated_by, reason))
+                    INSERT INTO configuration (key, value, updated_by)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (key) 
+                    DO UPDATE SET value = EXCLUDED.value, 
+                                  updated_at = CURRENT_TIMESTAMP,
+                                  updated_by = EXCLUDED.updated_by
+                """, (key, str(value), updated_by))
+                
+                # Логирование изменения
+                if old_value != value:
+                    cursor.execute("""
+                        INSERT INTO config_audit_log (field, old_value, new_value, changed_by, reason)
+                        VALUES (%s, %s, %s, %s, %s)
+                    """, (key, str(old_value) if old_value is not None else None, str(value), updated_by, reason))
+            
+            db_success = True
+            logger.info(f"Конфигурация {key} обновлена в PostgreSQL: {old_value} -> {value}")
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+            logger.warning(f"PostgreSQL недоступен при обновлении {key}, обновляем только fallback файл: {e}")
+        except Exception as e:
+            logger.error(f"Ошибка при обновлении конфигурации {key} в PostgreSQL: {e}")
         
-        logger.info(f"Конфигурация {key} обновлена: {old_value} -> {value}")
-        return True
+        # Обновление fallback файла (всегда, даже если БД недоступна)
+        file_success = False
+        if CONFIG_FALLBACK_ENABLED:
+            file_success = update_config_in_file(key, value)
+            if file_success:
+                logger.info(f"Конфигурация {key} обновлена в fallback файле: {old_value} -> {value}")
+            else:
+                logger.warning(f"Не удалось обновить fallback файл для ключа {key}")
+        
+        # Возвращаем True если хотя бы одно обновление успешно
+        return db_success or file_success
     except Exception as e:
         logger.error(f"Ошибка при установке конфигурации {key}: {e}")
         return False
 
 
 def get_all_config() -> Dict[str, Any]:
-    """Получение всей конфигурации"""
+    """
+    Получение всей конфигурации из БД с fallback на файл
+    """
     try:
         with get_db_cursor() as cursor:
             cursor.execute("SELECT key, value FROM configuration")
@@ -117,17 +167,76 @@ def get_all_config() -> Dict[str, Any]:
                     except ValueError:
                         config[key] = value
             return config
+    except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+        # Ошибка подключения к БД - используем fallback
+        logger.warning(f"PostgreSQL недоступен, используем fallback для всей конфигурации: {e}")
+        if CONFIG_FALLBACK_ENABLED:
+            config = get_all_config_from_file()
+            if config:
+                logger.info(f"Конфигурация загружена из fallback файла: {len(config)} ключей")
+            return config
+        return {}
     except Exception as e:
         logger.error(f"Ошибка при получении всей конфигурации: {e}")
+        # При любой другой ошибке тоже пробуем fallback
+        if CONFIG_FALLBACK_ENABLED:
+            return get_all_config_from_file()
         return {}
+
+
+async def periodic_sync_worker():
+    """Фоновая задача для периодической синхронизации конфигурации из БД в файл"""
+    global _sync_running
+    _sync_running = True
+    logger.info(f"Запущена фоновая задача синхронизации конфигурации (интервал: {CONFIG_SYNC_INTERVAL}с)")
+    
+    while _sync_running:
+        try:
+            await asyncio.sleep(CONFIG_SYNC_INTERVAL)
+            if CONFIG_FALLBACK_ENABLED:
+                sync_config_from_db()
+        except asyncio.CancelledError:
+            logger.info("Задача синхронизации конфигурации остановлена")
+            break
+        except Exception as e:
+            logger.error(f"Ошибка в задаче синхронизации конфигурации: {e}")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Управление жизненным циклом приложения"""
+    global _sync_task
+    
     logger.info("Запуск Config Service...")
+    
+    # Синхронизация конфигурации из БД в файл при старте
+    if CONFIG_FALLBACK_ENABLED:
+        logger.info("Синхронизация конфигурации из PostgreSQL в fallback файл при старте...")
+        try:
+            # Выполняем синхронизацию в отдельной задаче, чтобы не блокировать старт
+            sync_success = sync_config_from_db()
+            if sync_success:
+                logger.info("✅ Конфигурация успешно синхронизирована из PostgreSQL в fallback файл")
+            else:
+                logger.warning("⚠️ Не удалось синхронизировать конфигурацию из PostgreSQL, используется существующий fallback файл (если есть)")
+        except Exception as e:
+            logger.warning(f"Ошибка при синхронизации конфигурации при старте: {e}")
+        
+        # Запуск фоновой задачи для периодической синхронизации
+        _sync_task = asyncio.create_task(periodic_sync_worker())
+    
     yield
+    
+    # Shutdown
     logger.info("Остановка Config Service...")
+    global _sync_running
+    _sync_running = False
+    if _sync_task and not _sync_task.done():
+        _sync_task.cancel()
+        try:
+            await _sync_task
+        except asyncio.CancelledError:
+            pass
 
 
 # Создание FastAPI приложения
@@ -679,10 +788,18 @@ async def get_config_audit(
     description="""Проверка работоспособности сервиса (Config).
     
 **Response (200|503):**
-- status: 'healthy' | 'unhealthy'
+- status: 'healthy' | 'unhealthy' | 'degraded'
 - postgresql: 'connected' | 'disconnected' - статус подключения к PostgreSQL
+- fallback_enabled: включен ли fallback механизм (boolean)
+- fallback_file: информация о fallback файле (опционально)
+- sync_task_running: запущена ли задача синхронизации (опционально)
 
-**Статус 503:** возвращается, если PostgreSQL недоступен"""
+**Статусы:**
+- 'healthy': PostgreSQL доступен
+- 'degraded': PostgreSQL недоступен, но fallback файл доступен
+- 'unhealthy': PostgreSQL недоступен и fallback файл отсутствует или не работает
+
+**Статус 503:** возвращается только если PostgreSQL недоступен И fallback не работает"""
 )
 async def health_check():
     try:
@@ -692,24 +809,49 @@ async def health_check():
     except:
         db_ok = False
     
-    status_code = status.HTTP_200_OK if db_ok else status.HTTP_503_SERVICE_UNAVAILABLE
+    # Проверка fallback
+    fallback_info = None
+    fallback_available = False
+    if CONFIG_FALLBACK_ENABLED:
+        fallback_info = get_config_file_info()
+        fallback_available = fallback_info.get('exists', False) and fallback_info.get('keys_count', 0) > 0
+    
+    # Определение статуса
+    if db_ok:
+        status_val = "healthy"
+        status_code = status.HTTP_200_OK
+    elif fallback_available:
+        status_val = "degraded"
+        status_code = status.HTTP_200_OK  # Сервис работает, но в режиме fallback
+    else:
+        status_val = "unhealthy"
+        status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    
+    response_content = {
+        "status": status_val,
+        "postgresql": "connected" if db_ok else "disconnected",
+        "fallback_enabled": CONFIG_FALLBACK_ENABLED,
+        "sync_task_running": _sync_running if CONFIG_FALLBACK_ENABLED else False
+    }
+    
+    if CONFIG_FALLBACK_ENABLED and fallback_info:
+        response_content["fallback_file"] = fallback_info
     
     return JSONResponse(
         status_code=status_code,
-        content={
-            "status": "healthy" if db_ok else "unhealthy",
-            "postgresql": "connected" if db_ok else "disconnected"
-        }
+        content=response_content
     )
 
 
 if __name__ == "__main__":
     import uvicorn
+    import os
+    log_level = os.getenv("LOG_LEVEL", "INFO").lower()
     uvicorn.run(
         "app:app",
         host=API_HOST,
         port=API_PORT,
         reload=False,
-        log_level=LOG_LEVEL.lower()
+        log_level=log_level
     )
 

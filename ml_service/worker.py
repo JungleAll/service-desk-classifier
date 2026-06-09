@@ -2,7 +2,6 @@
 
 import asyncio
 import hashlib
-import logging
 import os
 import httpx
 from typing import Optional, Dict, Any
@@ -21,8 +20,9 @@ from shared.redis_client import (
     CACHE_PREDICTIONS
 )
 from shared.database import get_db_cursor
+from shared.logger import configure_service_logging
 
-logger = logging.getLogger(__name__)
+logger = configure_service_logging("ml.worker")
 
 # Глобальные переменные для управления worker
 _worker_task: Optional[asyncio.Task] = None

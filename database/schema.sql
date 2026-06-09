@@ -141,15 +141,14 @@ INSERT INTO configuration (key, value, description) VALUES
 ON CONFLICT (key) DO NOTHING;
 
 -- Вставка информации о модели v1.0 (единственная версия)
--- Используется classifier_smote_new.pkl
 INSERT INTO model_versions (version, model_path, vectorizer_path, label_encoder_path, accuracy, f1_score, is_active)
 VALUES (
     'v1.0',
-    'models/v1.0/classifier_smote_new.pkl',
-    'models/v1.0/vectorizer_smote.pkl',
-    'models/v1.0/label_encoder_smote.pkl',
-    0.9749,
-    0.9705,
+    'models/v1.0/classifier.pkl',
+    'models/v1.0/vectorizer.pkl',
+    'models/v1.0/label_encoder.pkl',
+    NULL,
+    NULL,
     TRUE
 )
 ON CONFLICT (version) DO NOTHING;

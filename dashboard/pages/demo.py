@@ -19,15 +19,9 @@ if 'api_client' not in st.session_state:
 if 'classification_history' not in st.session_state:
     st.session_state.classification_history = MOCK_HISTORY.copy()
 
-# Инициализация примера текста
-if 'example_texts' not in st.session_state:
-    st.session_state.example_texts = [
-        "Не могу войти в сетевой диск S:",
-        "Увольнение Иванова И.И. с должности менеджера",
-        "Заказать визитки для отдела продаж, 500 шт, белые",
-        "Согласование запроса на новую виртуальную машину",
-        "Падает соединение с ВМ, статус недоступна"
-    ]
+# Очистка старых данных example_texts (если остались)
+if 'example_texts' in st.session_state:
+    del st.session_state.example_texts
 
 
 def add_to_history(text: str, result: dict):
@@ -138,19 +132,8 @@ def main():
     if 'input_text' not in st.session_state:
         st.session_state.input_text = ""
     
-    # Кнопки для примеров
-    st.markdown("**Примеры для тестирования:**")
-    example_cols = st.columns(5)
-    for i, (col, example) in enumerate(zip(example_cols, st.session_state.example_texts)):
-        with col:
-            if st.button(f"Пример {i+1}", key=f"example_{i}", use_container_width=True):
-                st.session_state.input_text = example
-                st.rerun()
-    
     # Текстовое поле для ввода
     # Используем key="input_text" - Streamlit автоматически синхронизирует значение
-    # При нажатии на кнопки примеров значение устанавливается в st.session_state.input_text
-    # и автоматически отображается в text_area благодаря key
     # Не передаем value явно - Streamlit использует значение из session_state через key
     text_input = st.text_area(
         "Введите текст обращения:",

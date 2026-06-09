@@ -54,15 +54,21 @@ services:
       - REDIS_PORT=6379
       - CONFIG_SERVICE_URL=http://config-service:8002
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_DIR=/app/logs
+      - LOG_ENABLE_FILE=${LOG_ENABLE_FILE:-true}
+      - LOG_ENABLE_JSON=${LOG_ENABLE_JSON:-true}
+      - LOG_ENABLE_STDOUT=${LOG_ENABLE_STDOUT:-true}
     ports:
       - "8000:8000"
+    volumes:
+      - logs_data:/app/logs
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
       config-service:
-        condition: service_started
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -90,35 +96,31 @@ services:
       - CONFIG_SERVICE_URL=http://config-service:8002
       - OUTPUT_SERVICE_URL=http://output-service:8003
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      # API настройки
+      - LOG_DIR=/app/logs
+      - LOG_ENABLE_FILE=${LOG_ENABLE_FILE:-true}
+      - LOG_ENABLE_JSON=${LOG_ENABLE_JSON:-true}
+      - LOG_ENABLE_STDOUT=${LOG_ENABLE_STDOUT:-true}
       - API_RELOAD=${API_RELOAD:-false}
-      # Worker для автоматической обработки очереди
-      # ВАЖНО: Для production режима должен быть включен (true)
-      # Worker обрабатывает тикеты из очереди Redis и классифицирует их
       - WORKER_ENABLED=${WORKER_ENABLED:-true}
       - WORKER_QUEUE_TIMEOUT=${WORKER_QUEUE_TIMEOUT:-5}
       - WORKER_DELAY=${WORKER_DELAY:-0.1}
-      # Версия модели (по умолчанию v1.0)
-      # ПРИМЕЧАНИЕ: ML Service автоматически получает версию из Config Service при старте
-      # Эта переменная используется только как fallback, если Config Service недоступен
-      # Актуальная версия хранится в таблице configuration (ключ: current_model_version)
-      # В БД должна быть только одна версия v1.0 на основе classifier_smote_new.pkl
       - ML_MODEL_VERSION=${ML_MODEL_VERSION:-v1.0}
-      # Имена файлов модели (используется classifier_smote_new.pkl)
-      # Пути к файлам определяются из таблицы model_versions в БД
-      - ML_CLASSIFIER_FILE=${ML_CLASSIFIER_FILE:-classifier_smote_new.pkl}
-      - ML_VECTORIZER_FILE=${ML_VECTORIZER_FILE:-vectorizer_smote.pkl}
-      - ML_LABEL_ENCODER_FILE=${ML_LABEL_ENCODER_FILE:-label_encoder_smote.pkl}
+      - ML_CLASSIFIER_FILE=${ML_CLASSIFIER_FILE:-classifier.pkl}
+      - ML_VECTORIZER_FILE=${ML_VECTORIZER_FILE:-vectorizer.pkl}
+      - ML_LABEL_ENCODER_FILE=${ML_LABEL_ENCODER_FILE:-label_encoder.pkl}
     ports:
       - "8001:8001"
     volumes:
       - ./models:/app/models
+      - logs_data:/app/logs
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
       config-service:
+        condition: service_healthy
+      output-service:
         condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
@@ -143,8 +145,14 @@ services:
       - POSTGRES_USER=${POSTGRES_USER:-postgres}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_DIR=/app/logs
+      - LOG_ENABLE_FILE=${LOG_ENABLE_FILE:-true}
+      - LOG_ENABLE_JSON=${LOG_ENABLE_JSON:-true}
+      - LOG_ENABLE_STDOUT=${LOG_ENABLE_STDOUT:-true}
     ports:
       - "8002:8002"
+    volumes:
+      - logs_data:/app/logs
     depends_on:
       postgres:
         condition: service_healthy
@@ -187,13 +195,20 @@ services:
       - MAX_RETRY_ATTEMPTS=${MAX_RETRY_ATTEMPTS:-3}
       - RETRY_DELAY=${RETRY_DELAY:-5}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_DIR=/app/logs
+      - LOG_ENABLE_FILE=${LOG_ENABLE_FILE:-true}
+      - LOG_ENABLE_JSON=${LOG_ENABLE_JSON:-true}
+      - LOG_ENABLE_STDOUT=${LOG_ENABLE_STDOUT:-true}
     ports:
       - "8003:8003"
     volumes:
       # Volume for filesystem output (only used when DESTINATION_TYPE=filesystem)
       - output_data:/app/output
+      - logs_data:/app/logs
     depends_on:
       postgres:
+        condition: service_healthy
+      config-service:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
@@ -248,6 +263,7 @@ volumes:
   postgres_data:
   redis_data:
   output_data:  # Volume for filesystem output destination
+  logs_data:  # Volume for application logs (JSON format for ElasticSearch)
 
 networks:
   service-desk-network:

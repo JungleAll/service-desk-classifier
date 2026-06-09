@@ -1,3 +1,9 @@
+# Зависимости для database.py
 psycopg2-binary==2.9.9
+
+# Зависимости для redis_client.py
 redis==5.0.1
 
+# Примечание: logger.py использует только стандартную библиотеку Python
+# (logging, json, os, pathlib, datetime, typing, sys)
+# и не требует дополнительных зависимостей

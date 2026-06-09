@@ -1,6 +1,5 @@
 """FastAPI приложение для Output Service (Port 8003)"""
 
-import logging
 import asyncio
 import json
 import os
@@ -26,20 +25,17 @@ from .models import (
     SyncBatchResponse
 )
 from .config import (
-    API_HOST, API_PORT, LOG_LEVEL, MAX_RETRY_ATTEMPTS, RETRY_DELAY,
+    API_HOST, API_PORT, MAX_RETRY_ATTEMPTS, RETRY_DELAY,
     CONFIG_SERVICE_URL, CONFIG_SERVICE_TIMEOUT,
     JIRA_USER, JIRA_API_TOKEN
 )
 from .jira_client import JiraClient
 from .jira_sync import JiraSyncService
 from shared.database import get_db_cursor
+from shared.logger import configure_service_logging
 
 # Настройка логирования
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL.upper()),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+logger = configure_service_logging("output")
 
 # Клиент Jira
 jira_client = JiraClient()
@@ -1152,11 +1148,12 @@ async def search_jira_tickets(
 
 if __name__ == "__main__":
     import uvicorn
+    log_level = os.getenv("LOG_LEVEL", "INFO").lower()
     uvicorn.run(
         "app:app",
         host=API_HOST,
         port=API_PORT,
         reload=False,
-        log_level=LOG_LEVEL.lower()
+        log_level=log_level
     )
 

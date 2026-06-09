@@ -9,7 +9,12 @@ Service Desk Classifier — API Reference
 - Аутентификация: не требуется для демо; в проде добавьте OAuth/JWT/Key (вне рамок данного референса).
 - CORS: включен для всех сервисов.
 - Коды ошибок: 200/201 OK/Created; 202 Accepted; 400 Validation/Bad Request; 404 Not Found; 500 Internal; 503 Service Unavailable.
-- Статус: Документ обновлен и соответствует текущей реализации всех сервисов (проверено 2025-11-19, обновлено 2025-11-19).
+- Статус: Документ обновлен и соответствует текущей реализации всех сервисов (проверено 2025-01-19, обновлено 2025-01-19).
+- Изменения:
+  - Добавлен endpoint GET /metrics/unavailability в Ingestion Service для метрик недоступности
+  - Обновлен GET /health в Ingestion Service (добавлен config_service)
+  - Обновлен GET /health в Config Service (добавлена информация о fallback механизме)
+  - Улучшены сообщения об ошибках во всех сервисах (понятные для пользователей)
 
 Сервисы и базовые URL
 - Ingestion Service: http://localhost:8000
@@ -38,8 +43,12 @@ Service Desk Classifier — API Reference
   - estimated_processing_time: number (ms, default: 2000)
 - Errors: 
   - 400 — некорректные параметры (неверный source, priority, слишком короткий text)
-  - 503 — сервис отключен через Config Service
+  - 503 — сервис отключен через Config Service ИЛИ база данных PostgreSQL недоступна
+    - Сообщение: "Сервис автоматической классификации отключен" (если отключен через Config Service)
+    - Сообщение: "База данных PostgreSQL недоступна. Пожалуйста, повторите попытку позже." (если БД недоступна)
   - 500 — внутренняя ошибка
+    - Сообщение: "Внутренняя ошибка при создании обращения. Обратитесь к администратору системы. (ID: {ticket_id})"
+    - Включает ID тикета для отслеживания проблемы
 
 1.2 GET /tickets — Список обращений
 - Query: 
@@ -56,6 +65,11 @@ Service Desk Classifier — API Reference
   - total: number — общее количество
   - page: number — текущая страница (вычисляется из offset/limit)
   - pages: number — всего страниц
+- Errors:
+  - 503 — база данных PostgreSQL недоступна
+    - Сообщение: "База данных PostgreSQL недоступна. Пожалуйста, повторите попытку позже."
+  - 500 — внутренняя ошибка
+    - Сообщение: "Внутренняя ошибка при получении списка обращений. Обратитесь к администратору системы."
 
 1.3 GET /tickets/{ticket_id} — Детали обращения
 - Response (200)
@@ -78,7 +92,12 @@ Service Desk Classifier — API Reference
   - sent_to_jira_at?: ISO datetime — время отправки в destination
   - error_message?: string — сообщение об ошибке (если есть)
   - retry_count?: number — количество попыток
-- Errors: 404, 500
+- Errors: 
+  - 404 — обращение не найдено
+  - 503 — база данных PostgreSQL недоступна
+    - Сообщение: "База данных PostgreSQL недоступна. Пожалуйста, повторите попытку позже."
+  - 500 — внутренняя ошибка
+    - Сообщение: "Внутренняя ошибка при получении деталей обращения. Обратитесь к администратору системы."
 
 1.4 GET /status/{ticket_id} — Статус обработки
 - Response (200)
@@ -104,6 +123,12 @@ Service Desk Classifier — API Reference
   - created_at?: ISO datetime
   - processed_at?: ISO datetime — время завершения классификации
   - error_message?: string — сообщение об ошибке (если есть)
+- Errors:
+  - 404 — обращение не найдено
+  - 503 — база данных PostgreSQL недоступна
+    - Сообщение: "База данных PostgreSQL недоступна. Пожалуйста, повторите попытку позже."
+  - 500 — внутренняя ошибка
+    - Сообщение: "Внутренняя ошибка при получении статуса обращения. Обратитесь к администратору системы."
 
 1.5 POST /tickets/{ticket_id}/cancel — Отменить обработку
 - Request
@@ -113,7 +138,13 @@ Service Desk Classifier — API Reference
   - ticket_id: string
   - status: 'cancelled'
   - cancelled_at: ISO datetime
-- Errors: 404, 400 (если нельзя отменить — уже completed/cancelled), 500
+- Errors: 
+  - 404 — обращение не найдено
+  - 400 — нельзя отменить (уже completed/cancelled)
+  - 503 — база данных PostgreSQL недоступна
+    - Сообщение: "База данных PostgreSQL недоступна. Пожалуйста, повторите попытку позже."
+  - 500 — внутренняя ошибка
+    - Сообщение: "Внутренняя ошибка при отмене обращения. Обратитесь к администратору системы."
 
 1.6 POST /tickets/{ticket_id}/reprocess — Переотправить в очередь
 - Request
@@ -130,7 +161,13 @@ Service Desk Classifier — API Reference
   - Обновляет статус на 'queued' в БД
   - Опционально обновляет текст, если передан
   - Тикет будет обработан Worker'ом заново
-- Errors: 404, 400 (если нельзя переоформить без force), 500
+- Errors: 
+  - 404 — обращение не найдено
+  - 400 — нельзя переоформить без force (если уже completed)
+  - 503 — база данных PostgreSQL недоступна
+    - Сообщение: "База данных PostgreSQL недоступна. Пожалуйста, повторите попытку позже."
+  - 500 — внутренняя ошибка
+    - Сообщение: "Внутренняя ошибка при переоформлении обращения. Обратитесь к администратору системы."
 
 1.7 POST /tickets/batch — Пакетная загрузка
 - Request
@@ -145,8 +182,33 @@ Service Desk Classifier — API Reference
 1.8 GET /health — Здоровье сервиса (Ingestion)
 - Response (200|503)
   - status: 'healthy' | 'unhealthy'
-  - redis: 'connected' | 'disconnected'
-  - postgresql: 'connected' | 'disconnected'
+  - redis: 'connected' | 'disconnected' — статус подключения к Redis (очередь)
+  - postgresql: 'connected' | 'disconnected' — статус подключения к PostgreSQL
+  - config_service: 'connected' | 'disconnected' — статус подключения к Config Service
+- Поведение:
+  - Автоматически обновляет метрики недоступности при проверке
+  - Проверяет доступность всех зависимых сервисов
+- Статус 503: возвращается, если Redis или PostgreSQL недоступны
+
+1.9 GET /metrics/unavailability — Метрики недоступности сервисов
+- Response (200)
+  - config_service: объект с метриками недоступности Config Service
+  - postgresql: объект с метриками недоступности PostgreSQL
+  - redis: объект с метриками недоступности Redis
+- Для каждого сервиса возвращается:
+  - total_unavailability_count: number — общее количество событий недоступности
+  - is_available: boolean — доступен ли сервис сейчас
+  - last_unavailable_at?: ISO datetime — время последней недоступности
+  - last_successful_check_at?: ISO datetime — время последней успешной проверки
+  - time_since_unavailable_seconds?: number — секунд с последней недоступности
+  - time_since_successful_seconds?: number — секунд с последней успешной проверки
+  - recent_events_count: number — количество недавних событий
+  - recent_events: Array<{timestamp: ISO datetime, service: string, error?: string}> — последние 10 событий недоступности
+- Использование:
+  - Мониторинг доступности соседних сервисов
+  - Анализ истории недоступности для выявления проблемных периодов
+  - Настройка алертов при длительной недоступности
+  - Отладка проблем с подключением к зависимым сервисам
 
 
 2) ML Service (Port 8001)
@@ -217,6 +279,17 @@ Service Desk Classifier — API Reference
   - model_version?: string — версия модели после перезагрузки
 - Errors: 503 (если не удалось перезагрузить)
 
+2.7 GET /worker/diagnostics — Диагностика Worker и очереди
+- Response (200)
+  - worker_enabled: boolean — включен ли Worker (WORKER_ENABLED)
+  - worker_running: boolean — запущен ли Worker
+  - model_loaded: boolean — загружена ли модель
+  - queue_pending_length: number — количество тикетов в очереди pending_tickets
+  - queue_failed_length: number — количество тикетов в очереди failed_tickets
+  - redis_connected: boolean — подключен ли Redis
+  - message: string — сообщение о статусе
+- Использование: проверка состояния Worker и очереди при проблемах с обработкой тикетов
+
 
 3) Config Service (Port 8002)
 
@@ -284,7 +357,30 @@ Service Desk Classifier — API Reference
 - Response (200): { changes: Array<{ id, field, old_value?, new_value?, changed_by, reason?, changed_at }>, total }
 
 3.8 GET /health — Здоровье сервиса
-- Response (200|503): { status: 'healthy'|'unhealthy', postgresql: 'connected'|'disconnected' }
+- Response (200|503)
+  - status: 'healthy' | 'unhealthy' | 'degraded' — статус сервиса
+  - postgresql: 'connected' | 'disconnected' — статус подключения к PostgreSQL
+  - fallback_enabled: boolean — включен ли fallback механизм
+  - fallback_file?: object — информация о fallback файле (если fallback_enabled=true)
+    - exists: boolean — существует ли файл fallback конфигурации
+    - path: string — путь к файлу fallback конфигурации
+    - updated_at?: ISO datetime — время последнего обновления файла
+    - keys_count: number — количество ключей конфигурации в файле
+  - sync_task_running?: boolean — запущена ли задача синхронизации (если fallback_enabled=true)
+- Статусы:
+  - 'healthy': PostgreSQL доступен, конфигурация работает нормально
+  - 'degraded': PostgreSQL недоступен, но fallback файл работает (сервис продолжает функционировать)
+  - 'unhealthy': PostgreSQL недоступен и fallback файл отсутствует или не работает
+- Статус 503: возвращается только если PostgreSQL недоступен И fallback не работает
+- Поведение:
+  - При недоступности PostgreSQL Config Service автоматически переключается на fallback файл
+  - Fallback файл синхронизируется из БД при старте и периодически (настраивается через CONFIG_SYNC_INTERVAL)
+  - При каждом изменении конфигурации через API файл обновляется автоматически
+
+Переменные окружения (Config Service)
+- CONFIG_FALLBACK_ENABLED: 'true'|'false' (default: 'true') — включить/выключить fallback механизм
+- CONFIG_FALLBACK_DIR: string (default: './config_cache') — директория для хранения файла fallback конфигурации
+- CONFIG_SYNC_INTERVAL: number (default: 300) — интервал синхронизации конфигурации из БД в файл (в секундах)
 
 
 4) Output Service (Port 8003)
@@ -453,25 +549,114 @@ Service Desk Classifier — API Reference
 5) Dashboard (Port 8501)
 - UI на Streamlit.
 - Взаимодействует с Ingestion/ML/Config/Output API (см. dashboard/utils/api_client.py).
-- Основные потоки:
-  - Демо классификация: вызывает POST /classify (ML) и затем /process_result (Output)
-  - Мониторинг: читает метрики/события из БД
-  - Настройки: использует эндпойнты Config Service
+- **Режимы работы:**
+  - **Demo Mode** (по умолчанию): Прямая классификация через ML Service без логирования в БД
+  - **Production Mode**: Полный pipeline через Ingestion Service с логированием в ticket_events
+- **Используемые API:**
+
+**ML Service:**
+  - `POST /classify` — классификация текста (Demo Mode)
+  - `GET /health` — проверка работоспособности
+  - `GET /model/status` — информация о модели
+  - `POST /reload_model` — перезагрузка модели
+
+**Config Service:**
+  - `GET /config` — получение текущей конфигурации
+  - `POST /config/toggle` — включение/отключение автоклассификации
+  - `POST /config/model-version` — переключение версии модели
+  - `PUT /config/threshold` — изменение порога уверенности
+
+**Ingestion Service (Production Mode):**
+  - `POST /tickets` — создание тикета
+  - `GET /status/{ticket_id}` — проверка статуса обработки (polling)
+  - `GET /tickets/{ticket_id}` — получение деталей тикета
+
+**Основные потоки:**
+  - **Demo классификация**: POST /classify (ML) → результат сразу (без создания записи в БД)
+  - **Production классификация**: POST /tickets (Ingestion) → polling GET /status/{ticket_id} → GET /tickets/{ticket_id} (с полным логированием)
+  - **Мониторинг**: читает метрики/события из БД через прямые SQL запросы
+  - **Настройки**: использует эндпойнты Config Service для управления конфигурацией
 
 
 Ошибки и обработка
 - 400 ValidationError: некорректные параметры
+  - Сообщения содержат описание проблемы валидации
 - 404 Not Found: запись не найдена (ticket_id и т.п.)
+  - Сообщения указывают, какой ресурс не найден
 - 500 Internal Server Error: внутренняя ошибка сервиса
-- 503 Service Unavailable: зависимые подсистемы недоступны (модель не загружена, БД/Redis/Jira недоступны)
+  - Сообщения понятны для пользователей: "Внутренняя ошибка при [операции]. Обратитесь к администратору системы."
+  - Для критичных операций (создание тикета) включает ID для отслеживания
+- 503 Service Unavailable: зависимые подсистемы недоступны
+  - Модель не загружена (ML Service)
+  - БД/Redis/Jira недоступны
+  - Сообщения понятны: "База данных PostgreSQL недоступна. Пожалуйста, повторите попытку позже."
+  - Config Service: "Сервис автоматической классификации отключен" (если отключен через Config Service)
+  
+**Улучшенные сообщения об ошибках:**
+- Все сообщения об ошибках теперь понятны для конечных пользователей
+- Технические детали скрыты, но логируются для администраторов
+- Сообщения содержат рекомендации (повторить попытку, обратиться к администратору)
+- Для временных проблем (БД, Redis) используется статус 503 с понятными сообщениями
 
 Версионирование API
 - Текущая версия: v1 (без префикса). Для дальнейшего развития рекомендуется ввести /v1 префикс.
 
+Интеграции между сервисами
+
+Ниже описаны API вызовы, которые выполняются внутри системы между сервисами. Эти интеграции автоматические и не требуют ручного вызова, но важно понимать их для отладки и мониторинга.
+
+1) Ingestion Service → Config Service
+- GET /config — используется для проверки service_enabled перед созданием тикетов
+  - Вызывается в: POST /tickets (перед созданием тикета)
+  - Fallback: если Config Service недоступен, используется значение по умолчанию (True)
+  - Цель: предотвратить создание тикетов, когда сервис отключен через Config Service
+
+2) ML Service → Config Service
+- GET /config — используется для:
+  - Проверки current_model_version перед классификацией (автоперезагрузка модели при несоответствии)
+  - Получения confidence_threshold для определения decision (auto-process vs manual-review)
+  - Вызывается в:
+    - POST /classify (REST API) — проверка версии модели и порога уверенности
+    - Worker (асинхронная обработка очереди) — проверка версии модели перед классификацией, получение порога уверенности
+  - Fallback: если Config Service недоступен, используются значения по умолчанию
+  - Таймаут: 1.5-2.0 секунды (не блокирует классификацию)
+
+3) ML Service (Worker) → Output Service
+- POST /process_result — отправка результатов классификации для дальнейшей обработки
+  - Вызывается в: Worker после успешной классификации тикета
+  - Payload: { ticket_id, predicted_type, confidence, decision, model_version, text, source, user_id, email, priority, probabilities }
+  - Поведение: Worker автоматически отправляет результат в Output Service после обновления статуса на 'classified'
+  - Обработка ошибок: при ошибке Output Service тикет остается в статусе 'classified' (не переходит в 'failed'), ошибка записывается в error_message
+
+4) Output Service → Config Service
+- GET /config — используется для получения:
+  - Приоритетов: auto_process_priority, manual_review_priority
+  - Jira конфигурации: jira_enabled, jira_url, jira_user, jira_api_token, jira_project_key
+  - Вызывается в: POST /process_result (перед определением приоритета и отправкой в destination)
+  - Fallback: если Config Service недоступен, используется прямое чтение из БД (таблица configuration)
+  - Таймаут: CONFIG_SERVICE_TIMEOUT (по умолчанию 5 секунд)
+  - Цель: отказоустойчивость — система продолжает работать даже при недоступности Config Service
+
+5) Dashboard → Все сервисы
+- Использует API всех сервисов для демонстрации и управления (см. раздел 5) Dashboard)
+
+Важные замечания по интеграциям:
+- Все внутренние API вызовы имеют таймауты и обработку ошибок
+- При недоступности зависимого сервиса система использует fallback механизмы (значения по умолчанию или прямое чтение из БД)
+- Worker в ML Service автоматически обрабатывает очередь и интегрируется с Config Service и Output Service
+- Output Service имеет встроенный fallback на БД при недоступности Config Service API
+- Config Service имеет fallback механизм через файл конфигурации при недоступности PostgreSQL
+  - Файл синхронизируется из БД при старте и периодически (настраивается через CONFIG_SYNC_INTERVAL)
+  - При каждом изменении конфигурации через API файл обновляется автоматически
+  - При недоступности PostgreSQL Config Service продолжает работать в режиме 'degraded' используя fallback файл
+- Ingestion Service отслеживает метрики недоступности всех соседних сервисов
+  - Метрики доступны через GET /metrics/unavailability
+  - Автоматически обновляются при всех операциях с зависимыми сервисами
+  - Позволяют отслеживать историю недоступности и настраивать алерты
+
 Ссылки
-- Архитектура: README-ARCHITECTURE.md
-- Быстрый старт: QUICKSTART.md
+- Архитектура: ARCHITECTURE.md
+- Быстрый старт: startup-guide.md
 - Подробный запуск: startup-guide.md
-- Руководство по реализации: API_IMPLEMENTATION_GUIDE.md
 
 

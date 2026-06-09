@@ -1,6 +1,5 @@
 """FastAPI приложение для классификации обращений Service Desk"""
 
-import logging
 import time
 import asyncio
 from contextlib import asynccontextmanager
@@ -29,7 +28,7 @@ from .models import (
     ReloadResponse,
     WorkerDiagnosticsResponse
 )
-from .config import API_HOST, API_PORT, LOG_LEVEL, WORKER_ENABLED, CONFIDENCE_THRESHOLD
+from .config import API_HOST, API_PORT, WORKER_ENABLED, CONFIDENCE_THRESHOLD
 from .worker import start_worker, stop_worker, is_worker_running
 from shared.redis_client import (
     get_cache, 
@@ -41,13 +40,10 @@ from shared.redis_client import (
     get_redis_queue_client
 )
 from shared.database import get_db_cursor
+from shared.logger import configure_service_logging
 
 # Настройка логирования
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL.upper()),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+logger = configure_service_logging("ml")
 
 # Глобальный экземпляр классификатора
 classifier = ServiceDeskClassifier()
@@ -783,11 +779,12 @@ async def worker_diagnostics() -> WorkerDiagnosticsResponse:
 
 if __name__ == "__main__":
     import uvicorn
+    log_level = os.getenv("LOG_LEVEL", "INFO").lower()
     uvicorn.run(
         "app:app",
         host=API_HOST,
         port=API_PORT,
         reload=False,
-        log_level=LOG_LEVEL.lower()
+        log_level=log_level
     )
 

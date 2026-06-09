@@ -1,9 +1,8 @@
-# Service Desk Classifier Architecture
+# Service Desk Classifier — Architecture
 
-Документ описывает архитектуру системы автоматической классификации обращений Service Desk с учетом текущей реализации.
+Документ описывает архитектуру системы автоматической классификации обращений Service Desk. Краткий обзор и ключевые диаграммы — в [README.md](README.md).
 
-**Дата обновления:** 2025-11-19  
-**Версия:** 3.4 (актуализировано с учетом фактической реализации: добавлены эндпоинты синхронизации Jira, уточнены статусы и коннекторы)
+**Примечание:** артефакты ML-модели (`.pkl`) не включены в репозиторий; см. [models/v1.0/README_models.md](models/v1.0/README_models.md).
 
 ---
 
@@ -11,43 +10,44 @@
 
 ```mermaid
 graph TB
-    subgraph External["🌍 EXTERNAL SYSTEMS"]
-        Users["👤 Users"]
-        DataScientists["👨‍💻 Data Scientists"]
-        EmailSource["📧 Email"]
-        ChatSource["💬 Chat Bot"]
-        APISource["🔌 API"]
-        JiraSystem["📋 Jira REST API"]
+    subgraph External["EXTERNAL SYSTEMS"]
+        Users["Users"]
+        DataScientists["Data Scientists"]
+        EmailSource["Email"]
+        ChatSource["Chat Bot"]
+        APISource["API"]
+        JiraSystem["Jira REST API"]
     end
     
-    subgraph System["🏢 SERVICE DESK AUTOMATION PLATFORM"]
-        subgraph Ingestion["📥 INGESTION LAYER"]
-            IngestionAPI["🔹 Ingestion API<br/>FastAPI - Port 8000<br/>POST /tickets<br/>GET /status/{id}<br/>GET /tickets<br/>GET /tickets/{id}<br/>POST /tickets/{id}/cancel<br/>POST /tickets/{id}/reprocess<br/>POST /tickets/batch"]
+    subgraph System["SERVICE DESK AUTOMATION PLATFORM"]
+        subgraph Ingestion["INGESTION LAYER"]
+            IngestionAPI["Ingestion API<br/>FastAPI - Port 8000<br/>POST /tickets<br/>GET /status/{id}<br/>GET /tickets<br/>GET /tickets/{id}<br/>POST /tickets/{id}/cancel<br/>POST /tickets/{id}/reprocess<br/>POST /tickets/batch"]
         end
         
-        subgraph Queue["📦 MESSAGE QUEUE & CACHE"]
-            Redis["🔸 Redis<br/>DB 0: Queues<br/>- pending_tickets<br/>- failed_tickets<br/>DB 1: Cache<br/>- cache_predictions<br/>(TTL 1 hour)"]
+        subgraph Queue["MESSAGE QUEUE & CACHE"]
+            Redis["Redis<br/>DB 0: Queues<br/>- pending_tickets<br/>- failed_tickets<br/>DB 1: Cache<br/>- cache_predictions<br/>(TTL 1 hour)"]
         end
         
-        subgraph Config["⚙️ CONFIG LAYER"]
-            ConfigAPI["🔹 Config Service<br/>FastAPI - Port 8002<br/>GET /config<br/>POST /config/toggle<br/>POST /config/model-version<br/>PUT /config/threshold<br/>POST /config/jira<br/>GET /config/audit"]
+        subgraph Config["CONFIG LAYER"]
+            ConfigAPI["Config Service<br/>FastAPI - Port 8002<br/>GET /config<br/>POST /config/toggle<br/>POST /config/model-version<br/>PUT /config/threshold<br/>POST /config/jira<br/>GET /config/audit"]
         end
         
-        subgraph Processing["⚡ PROCESSING LAYER"]
-            MLService["🔹 ML Service<br/>FastAPI - Port 8001<br/>POST /classify<br/>POST /classify/batch<br/>GET /model/status<br/>GET /model/list<br/>POST /reload_model<br/>Worker (Async Queue)"]
+        subgraph Processing["PROCESSING LAYER"]
+            MLService["ML Service<br/>FastAPI - Port 8001<br/>POST /classify<br/>POST /classify/batch<br/>GET /model/status<br/>GET /model/list<br/>POST /reload_model<br/>Worker (Async Queue)"]
         end
         
-        subgraph Output["📤 OUTPUT LAYER"]
-            OutputService["🔹 Output Service<br/>FastAPI - Port 8003<br/>POST /process_result<br/>GET /health<br/>POST /sync/jira/ticket<br/>POST /sync/jira/batch<br/>POST /sync/jira/jql<br/>POST /sync/jira/all<br/>GET /jira/ticket/{id}<br/>GET /jira/search<br/>- Destination connectors (Jira/FileSystem/Mock)<br/>- DESTINATION_TYPE configuration<br/>- Auto-process decision<br/>- Config Service integration<br/>- Fallback to DB<br/>- Error handling<br/>- Retry mechanisms<br/>- Jira synchronization service"]
+        subgraph Output["OUTPUT LAYER"]
+            OutputService["Output Service<br/>FastAPI - Port 8003<br/>POST /process_result<br/>GET /health<br/>POST /sync/jira/ticket<br/>POST /sync/jira/batch<br/>POST /sync/jira/jql<br/>POST /sync/jira/all<br/>GET /jira/ticket/{id}<br/>GET /jira/search<br/>- Destination connectors (Jira/FileSystem/Mock)<br/>- DESTINATION_TYPE configuration<br/>- Auto-process decision<br/>- Config Service integration<br/>- Fallback to DB<br/>- Error handling<br/>- Retry mechanisms<br/>- Jira synchronization service"]
         end
         
-        subgraph Data["💾 DATA & PERSISTENCE"]
-            PostgreSQL["🗄️ PostgreSQL (Port 5432)<br/>- ticket_events<br/>- metrics<br/>- configuration<br/>- config_audit_log<br/>- model_versions<br/>- error_logs<br/>- audit_logs"]
-            ModelRegistry["📦 Model Registry<br/>models/v1.0/<br/>- classifier_smote_new.pkl<br/>- vectorizer_smote.pkl<br/>- label_encoder_smote.pkl"]
+        subgraph Data["DATA & PERSISTENCE"]
+            PostgreSQL["PostgreSQL (Port 5432)<br/>- ticket_events<br/>- metrics<br/>- configuration<br/>- config_audit_log<br/>- model_versions<br/>- error_logs<br/>- audit_logs"]
+            ModelRegistry["Model Registry<br/>models/v1.0/<br/>- classifier.pkl<br/>- vectorizer.pkl<br/>- label_encoder.pkl<br/>(not in repo)"]
+            LogFiles["Application Logs<br/>/app/logs/<br/>- ingestion.log (JSON)<br/>- ml.log (JSON)<br/>- config.log (JSON)<br/>- output.log (JSON)<br/>- Ротация: 10MB, 5 файлов"]
         end
         
-        subgraph Monitoring["📊 MONITORING & ADMIN"]
-            Dashboard["🔹 Dashboard<br/>Streamlit - Port 8501<br/>- Demo Classification<br/>- Production Mode<br/>- Monitoring<br/>- Settings Management"]
+        subgraph Monitoring["MONITORING & ADMIN"]
+            Dashboard["Dashboard<br/>Streamlit - Port 8501<br/>- Demo Classification<br/>- Production Mode<br/>- Monitoring<br/>- Settings Management"]
         end
     end
     
@@ -85,6 +85,12 @@ graph TB
     Dashboard -->|classify text| MLService
     Dashboard -->|production mode| IngestionAPI
     
+    %% Logging
+    IngestionAPI -->|write logs| LogFiles
+    MLService -->|write logs| LogFiles
+    ConfigAPI -->|write logs| LogFiles
+    OutputService -->|write logs| LogFiles
+    
     style System fill:#E8F4F8,stroke:#2E5C8A,stroke-width:2px
     style Ingestion fill:#B3E5FC,stroke:#01579B
     style Queue fill:#FFF9C4,stroke:#F57F17
@@ -102,26 +108,26 @@ graph TB
 
 ```mermaid
 graph TB
-    subgraph Ingestion["📥 INGESTION LAYER (Port 8000)"]
+    subgraph Ingestion["INGESTION LAYER (Port 8000)"]
         IngAPI["FastAPI App"]
         IngModels["Pydantic Models<br/>TicketRequest<br/>TicketResponse<br/>TicketStatusResponse"]
         TicketHandler["Ticket Handler<br/>- Validation<br/>- DB Insert<br/>- Queue Push"]
     end
     
-    subgraph ML["⚡ ML LAYER (Port 8001)"]
+    subgraph ML["ML LAYER (Port 8001)"]
         MLAPI["FastAPI App"]
         Preprocessor["Text Preprocessor<br/>- Lemmatization<br/>- Stopwords<br/>- Normalization"]
         Classifier["Model Classifier<br/>- LogisticRegression<br/>- TF-IDF Vectorizer<br/>- Label Encoder"]
-        MLModels["ML Models<br/>v1.0 (97.49% accuracy)"]
+        MLModels["ML Models<br/>v1.0 (LogisticRegression)"]
         Worker["Worker<br/>(Async Queue Processor)"]
     end
     
-    subgraph Config["⚙️ CONFIG LAYER (Port 8002)"]
+    subgraph Config["CONFIG LAYER (Port 8002)"]
         ConfigAPI["FastAPI App"]
         ConfigMgr["Config Manager<br/>- Version Control<br/>- Audit Logging<br/>- Threshold Management"]
     end
     
-    subgraph Output["📤 OUTPUT LAYER (Port 8003)"]
+    subgraph Output["OUTPUT LAYER (Port 8003)"]
         OutputAPI["FastAPI App"]
         ConfigClient["Config Client<br/>- REST API Integration<br/>- Fallback to DB"]
         DestinationFactory["Destination Factory<br/>- DESTINATION_TYPE selector<br/>- Jira/FileSystem/Mock"]
@@ -131,14 +137,19 @@ graph TB
         AuditLogger["Audit Logger<br/>- Action Tracking<br/>- Error Logging"]
     end
     
-    subgraph Data["💾 DATA LAYER"]
+    subgraph Data["DATA LAYER"]
         PG["PostgreSQL<br/>- ticket_events<br/>- metrics<br/>- configuration<br/>- model_versions"]
         RedisQueues["Redis DB 0<br/>Queues:<br/>- pending_tickets<br/>- failed_tickets"]
         RedisCache["Redis DB 1<br/>Cache:<br/>- cache_predictions<br/>(TTL 1h)"]
         ModelReg["Model Registry<br/>models/v1.0/"]
+        LogFiles["Application Logs<br/>/app/logs/<br/>JSON format<br/>Rotating files"]
     end
     
-    subgraph Monitoring["📊 MONITORING"]
+    subgraph Shared["SHARED MODULES"]
+        Logger["Logger Module<br/>shared/logger.py<br/>- JSON Formatter<br/>- File Handler<br/>- Stdout Handler<br/>- ElasticSearch ready"]
+    end
+    
+    subgraph Monitoring["MONITORING"]
         Dashboard["Streamlit Dashboard<br/>- Demo Mode<br/>- Production Mode"]
         WebUI["Web UI<br/>- Classification<br/>- Monitoring<br/>- Settings"]
     end
@@ -149,6 +160,7 @@ graph TB
     TicketHandler --> PG
     TicketHandler --> RedisQueues
     TicketHandler --> ConfigAPI
+    IngAPI --> Logger
     
     %% ML flow
     RedisQueues --> Worker
@@ -160,10 +172,13 @@ graph TB
     Classifier --> PG
     MLAPI --> ConfigAPI
     MLAPI --> OutputAPI
+    MLAPI --> Logger
+    Worker --> Logger
     
     %% Config flow
     ConfigAPI --> ConfigMgr
     ConfigMgr --> PG
+    ConfigAPI --> Logger
     
     %% Output flow
     OutputAPI --> ConfigClient
@@ -178,6 +193,10 @@ graph TB
     FileSystemConn --> PG
     MockConn --> PG
     AuditLogger --> PG
+    OutputAPI --> Logger
+    
+    %% Logger flow
+    Logger --> LogFiles
     
     %% Dashboard flow
     Dashboard --> WebUI
@@ -203,16 +222,16 @@ graph TB
 
 ```mermaid
 sequenceDiagram
-    participant Client as 👤 Client
-    participant Ingestion as 📥 Ingestion Service<br/>(Port 8000)
-    participant RedisQ as 📦 Redis Queue<br/>(DB 0)
-    participant RedisC as 💾 Redis Cache<br/>(DB 1)
-    participant ML as ⚡ ML Service<br/>(Port 8001)
-    participant Config as ⚙️ Config Service<br/>(Port 8002)
-    participant Output as 📤 Output Service<br/>(Port 8003)
-    participant PG as 🗄️ PostgreSQL
-    participant Jira as 📋 Jira API
-    participant Dashboard as 📊 Dashboard<br/>(Port 8501)
+    participant Client as Client
+    participant Ingestion as Ingestion Service<br/>(Port 8000)
+    participant RedisQ as Redis Queue<br/>(DB 0)
+    participant RedisC as Redis Cache<br/>(DB 1)
+    participant ML as ML Service<br/>(Port 8001)
+    participant Config as Config Service<br/>(Port 8002)
+    participant Output as Output Service<br/>(Port 8003)
+    participant PG as PostgreSQL
+    participant Jira as Jira API
+    participant Dashboard as Dashboard<br/>(Port 8501)
 
     %% Ticket Creation Flow
     Client->>Ingestion: POST /tickets<br/>{text, source, ...}
@@ -284,7 +303,7 @@ sequenceDiagram
 
 ```mermaid
 graph LR
-    subgraph Redis["🔸 Redis Server"]
+    subgraph Redis["Redis Server"]
         subgraph DB0["Database 0: Queues"]
             PendingQueue["pending_tickets<br/>List (RPUSH/BLPOP)<br/>No TTL"]
             FailedQueue["failed_tickets<br/>List (RPUSH/LPOP)<br/>No TTL"]
@@ -318,15 +337,15 @@ graph LR
 
 ```mermaid
 graph TB
-    subgraph Dashboard["📊 Dashboard (Port 8501)"]
+    subgraph Dashboard["Dashboard (Port 8501)"]
         ModeSelector["Mode Selector<br/>demo | production"]
         
-        subgraph DemoMode["⚡ Demo Mode"]
+        subgraph DemoMode["Demo Mode"]
             DemoClient["API Client"]
             DirectML["Direct ML Service<br/>POST /classify"]
         end
         
-        subgraph ProdMode["🔒 Production Mode"]
+        subgraph ProdMode["Production Mode"]
             ProdClient["API Client"]
             IngestionFlow["Ingestion Service<br/>POST /tickets"]
             Polling["Status Polling<br/>GET /status/{id}"]
@@ -429,52 +448,52 @@ stateDiagram-v2
 ## Разделение ответственности сервисов
 
 ### 1. Ingestion Service (Port 8000)
-- ✅ Прием и валидация обращений (`POST /tickets`)
-- ✅ Управление жизненным циклом тикетов
-- ✅ Постановка в очередь Redis (DB 0)
-- ✅ Сохранение в PostgreSQL (`ticket_events`)
-- ✅ Проверка конфигурации через Config Service
-- ❌ **НЕ выполняет классификацию** - классификация находится в ML Service
+- Прием и валидация обращений (`POST /tickets`)
+- Управление жизненным циклом тикетов
+- Постановка в очередь Redis (DB 0)
+- Сохранение в PostgreSQL (`ticket_events`)
+- Проверка конфигурации через Config Service
+- Не выполняет классификацию — ответственность ML Service
 
 ### 2. ML Service (Port 8001)
-- ✅ Классификация текста через ML модель (`POST /classify`)
-- ✅ Кэширование результатов в Redis (DB 1)
-- ✅ Управление моделями (загрузка, перезагрузка, переключение версий)
-- ✅ Автоматическая обработка очереди через Worker
-- ✅ Запись метрик в PostgreSQL
-- ✅ Проверка версии модели из Config Service
+- Классификация текста через ML модель (`POST /classify`)
+- Кэширование результатов в Redis (DB 1)
+- Управление моделями (загрузка, перезагрузка, переключение версий)
+- Автоматическая обработка очереди через Worker
+- Запись метрик в PostgreSQL
+- Проверка версии модели из Config Service
 
 ### 3. Config Service (Port 8002)
-- ✅ Централизованное управление конфигурацией
-- ✅ Аудит изменений (`config_audit_log`)
-- ✅ Управление версиями моделей
-- ✅ Управление порогами уверенности
-- ✅ Управление настройками Jira
+- Централизованное управление конфигурацией
+- Аудит изменений (`config_audit_log`)
+- Управление версиями моделей
+- Управление порогами уверенности
+- Управление настройками Jira
 
 ### 4. Output Service (Port 8003)
-- ✅ Обработка результатов классификации
-- ✅ Плагинные коннекторы назначения (Destination Connectors):
+- Обработка результатов классификации
+- Плагинные коннекторы назначения (Destination Connectors):
   - **Jira Connector:** отправка в Jira REST API (требует `DESTINATION_TYPE=jira`)
     - Поддерживает стандартный Jira REST API (`/rest/api/3/issue`)
     - Поддерживает Jira Service Desk API (`/rest/servicedeskapi/request`) при `JIRA_USE_SERVICEDESK_API=true`
   - **FileSystem Connector:** сохранение JSON файлов в `OUTPUT_DIR` (по умолчанию, `DESTINATION_TYPE=filesystem` или `fs` или `file`)
   - **Mock Connector:** тестовый режим без отправки (`DESTINATION_TYPE=mock`)
-- ✅ Выбор коннектора через переменную окружения `DESTINATION_TYPE`
-- ✅ Определение приоритетов из Config Service (auto_process_priority, manual_review_priority)
-- ✅ Интеграция с Config Service API с fallback на БД
-- ✅ Retry механизмы для Jira
-- ✅ Аудит действий (`audit_logs`)
-- ✅ Отправка только при `decision=auto-process`
-- ✅ Синхронизация данных из Jira для дообучения модели (JiraSyncService)
+- Выбор коннектора через переменную окружения `DESTINATION_TYPE`
+- Определение приоритетов из Config Service (auto_process_priority, manual_review_priority)
+- Интеграция с Config Service API с fallback на БД
+- Retry механизмы для Jira
+- Аудит действий (`audit_logs`)
+- Отправка только при `decision=auto-process`
+- Синхронизация данных из Jira для дообучения модели (JiraSyncService)
   - Синхронизация actual_type, feedback_status из Jira в PostgreSQL
   - Поддержка пакетной синхронизации и синхронизации по JQL
 
 ### 5. Dashboard (Port 8501)
-- ✅ **Demo режим:** Прямая классификация через ML Service (без логирования в БД)
-- ✅ **Production режим:** Полный pipeline через Ingestion Service (с логированием в `ticket_events`)
-- ✅ Мониторинг системы
-- ✅ Управление конфигурацией
-- ✅ Просмотр метрик и истории
+- **Demo режим:** Прямая классификация через ML Service (без логирования в БД)
+- **Production режим:** Полный pipeline через Ingestion Service (с логированием в `ticket_events`)
+- Мониторинг системы
+- Управление конфигурацией
+- Просмотр метрик и истории
 
 ---
 
@@ -586,7 +605,7 @@ Dashboard → ML Service (POST /classify)
   → Классификация (если нет в кэше)
   → Сохранение в кэш
   → Возврат результата
-  ❌ НЕ создает запись в ticket_events
+  Не создает запись в ticket_events
 ```
 
 ### 5. Dashboard - Production Mode
@@ -596,7 +615,7 @@ Dashboard → Ingestion Service (POST /tickets)
   → Добавление в очередь Redis DB 0
   → Polling статуса (GET /status/{ticket_id})
   → Получение результата (GET /tickets/{ticket_id})
-  ✅ Создает запись в ticket_events
+  Создает запись в ticket_events
 ```
 
 ---
@@ -692,10 +711,39 @@ Dashboard → Ingestion Service (POST /tickets)
   - `GET /jira/ticket/{jira_ticket_id}` - получение данных из Jira (без синхронизации)
   - `GET /jira/search` - поиск в Jira по JQL (без синхронизации)
 
+### Централизованное логирование приложений
+- **Модуль:** `shared/logger.py` - единый модуль логирования для всех сервисов
+- **Форматы вывода:**
+  - **JSON формат (файлы):** структурированные логи в JSON для интеграции с ElasticSearch
+    - Поля: `@timestamp`, `service`, `level`, `logger`, `message`, `module`, `function`, `line`
+    - Поддержка дополнительных полей: `ticket_id`, `request_id`, `duration_ms`, `user_id`
+    - Сохранение в `/app/logs/{service}.log` внутри контейнеров
+  - **Стандартный формат (stdout):** человекочитаемый формат для совместимости с Docker logs
+- **Ротация логов:**
+  - Автоматическая ротация при достижении максимального размера (по умолчанию 10MB)
+  - Хранение до 5 резервных файлов (настраивается через `LOG_BACKUP_COUNT`)
+  - Использование `RotatingFileHandler` для управления размером файлов
+- **Конфигурация через переменные окружения:**
+  - `LOG_LEVEL` - уровень логирования (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+  - `LOG_DIR` - директория для сохранения логов (по умолчанию `./logs`)
+  - `LOG_ENABLE_FILE` - включить файловое логирование (по умолчанию `true`)
+  - `LOG_ENABLE_JSON` - включить JSON формат для файлов (по умолчанию `true`)
+  - `LOG_ENABLE_STDOUT` - включить вывод в stdout (по умолчанию `true`)
+  - `LOG_MAX_BYTES` - максимальный размер файла перед ротацией (по умолчанию 10485760 = 10MB)
+  - `LOG_BACKUP_COUNT` - количество резервных файлов (по умолчанию 5)
+- **Интеграция с ElasticSearch:**
+  - JSON формат логов готов для интеграции через Filebeat/Logstash/Fluentd
+  - Структурированные поля позволяют эффективно индексировать и искать логи
+  - Поддержка метаданных (service, timestamp, level) для фильтрации и агрегации
+  - Подробная документация по интеграции в `LOGGING_GUIDE.md`
+- **Использование в сервисах:**
+  - Все сервисы используют единый интерфейс: `configure_service_logging(service_name)`
+  - Автоматическая настройка через переменные окружения
+  - Поддержка дополнительных полей через `extra` параметр в методах логирования
+
 ---
 
-**Важно:** `POST /classify` находится **только в ML Service (Port 8001)**, а не в Ingestion Service. Это правильное разделение ответственности в микросервисной архитектуре.
+**Важно:** `POST /classify` находится **только в ML Service (Port 8001)**, а не в Ingestion Service.
 
-**Дата обновления:** 2025-11-19  
-**Версия:** 3.4 (актуализировано с учетом фактической реализации: добавлены эндпоинты синхронизации Jira, уточнены статусы и коннекторы)
+**Логирование:** все сервисы используют централизованный модуль `shared/logger.py` с JSON-форматом для файлов и стандартным форматом для stdout.
 

@@ -1,6 +1,5 @@
 """FastAPI приложение для Ingestion Service (Port 8000)"""
 
-import logging
 import uuid
 import json
 from datetime import datetime
@@ -25,7 +24,7 @@ from .models import (
     BatchTicketResponse,
     ErrorResponse
 )
-from .config import API_HOST, API_PORT, LOG_LEVEL, CONFIG_SERVICE_URL
+from .config import API_HOST, API_PORT, CONFIG_SERVICE_URL
 from shared.redis_client import (
     push_to_queue,
     QUEUE_PENDING_TICKETS
@@ -35,25 +34,42 @@ from shared.database import (
     execute_query,
     execute_insert
 )
+from shared.logger import configure_service_logging
+from .metrics import record_unavailability, record_success, get_metrics, get_service_status
 import httpx
+import psycopg2
 
 # Настройка логирования
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL.upper()),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+logger = configure_service_logging("ingestion")
 
 
 async def check_service_enabled() -> bool:
     """Проверка, включен ли сервис через Config Service"""
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.get(f"{CONFIG_SERVICE_URL}/config")
             if response.status_code == 200:
                 config = response.json()
+                record_success("config_service")
                 return config.get("service_enabled", True)
+            else:
+                error_msg = f"Config Service вернул статус {response.status_code}"
+                record_unavailability("config_service", error_msg)
+                logger.warning(f"Не удалось проверить статус сервиса через Config Service: {error_msg}")
+                return True  # По умолчанию включен
+    except httpx.TimeoutException as e:
+        error_msg = f"Таймаут при подключении к Config Service ({CONFIG_SERVICE_URL})"
+        record_unavailability("config_service", error_msg)
+        logger.warning(f"{error_msg}: {e}")
+        return True  # По умолчанию включен
+    except httpx.ConnectError as e:
+        error_msg = f"Не удалось подключиться к Config Service ({CONFIG_SERVICE_URL})"
+        record_unavailability("config_service", error_msg)
+        logger.warning(f"{error_msg}: {e}")
+        return True  # По умолчанию включен
     except Exception as e:
+        error_msg = f"Неожиданная ошибка при проверке Config Service: {str(e)}"
+        record_unavailability("config_service", error_msg)
         logger.warning(f"Не удалось проверить статус сервиса через Config Service: {e}")
         return True  # По умолчанию включен
     return True
@@ -169,21 +185,26 @@ async def create_ticket(request: TicketRequest) -> TicketResponse:
     
     try:
         # Сохранение в БД
-        with get_db_cursor() as cursor:
-            cursor.execute("""
-                INSERT INTO ticket_events (
-                    ticket_id, text, source, user_id, email, priority, 
-                    category_hint, metadata, status, created_at
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
-            """, (
-                ticket_id, request.text, request.source, request.user_id,
-                request.email, request.priority, request.category_hint,
-                json.dumps(request.metadata) if request.metadata else None,
-                'queued', created_at
-            ))
-            result = cursor.fetchone()
+        try:
+            with get_db_cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO ticket_events (
+                        ticket_id, text, source, user_id, email, priority, 
+                        category_hint, metadata, status, created_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                """, (
+                    ticket_id, request.text, request.source, request.user_id,
+                    request.email, request.priority, request.category_hint,
+                    json.dumps(request.metadata) if request.metadata else None,
+                    'queued', created_at
+                ))
+                result = cursor.fetchone()
+            record_success("postgresql")
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as db_error:
+            record_unavailability("postgresql", f"PostgreSQL error: {str(db_error)}")
+            raise
         
         # Добавление в очередь Redis
         queue_data = {
@@ -195,14 +216,21 @@ async def create_ticket(request: TicketRequest) -> TicketResponse:
         }
         
         if not push_to_queue(QUEUE_PENDING_TICKETS, queue_data):
+            error_msg = "Не удалось добавить обращение в очередь обработки. Redis может быть недоступен."
+            record_unavailability("redis", "Failed to push to queue")
             logger.error(f"Не удалось добавить ticket {ticket_id} в очередь Redis")
             # Обновляем статус на failed
-            with get_db_cursor() as cursor:
-                cursor.execute("""
-                    UPDATE ticket_events
-                    SET status = 'failed', error_message = 'Failed to add to queue'
-                    WHERE ticket_id = %s
-                """, (ticket_id,))
+            try:
+                with get_db_cursor() as cursor:
+                    cursor.execute("""
+                        UPDATE ticket_events
+                        SET status = 'failed', error_message = %s
+                        WHERE ticket_id = %s
+                    """, (error_msg, ticket_id))
+            except Exception as db_error:
+                logger.error(f"Не удалось обновить статус тикета {ticket_id} в БД: {db_error}")
+        else:
+            record_success("redis")
         
         logger.info(f"Обращение {ticket_id} создано и добавлено в очередь")
         
@@ -214,7 +242,36 @@ async def create_ticket(request: TicketRequest) -> TicketResponse:
             estimated_processing_time=2000
         )
         
+    except psycopg2.OperationalError as e:
+        error_msg = "База данных PostgreSQL недоступна. Пожалуйста, повторите попытку позже."
+        record_unavailability("postgresql", f"PostgreSQL OperationalError: {str(e)}")
+        logger.error(f"Ошибка подключения к PostgreSQL при создании обращения: {e}", exc_info=True)
+        
+        # Логирование ошибки
+        try:
+            with get_db_cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO error_logs (service_name, error_type, error_message, ticket_id)
+                    VALUES (%s, %s, %s, %s)
+                """, ("ingestion", "DatabaseConnectionError", str(e), ticket_id))
+        except:
+            pass
+        
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=error_msg
+        )
+    except psycopg2.InterfaceError as e:
+        error_msg = "Ошибка соединения с базой данных PostgreSQL. Пожалуйста, повторите попытку позже."
+        record_unavailability("postgresql", f"PostgreSQL InterfaceError: {str(e)}")
+        logger.error(f"Ошибка интерфейса PostgreSQL при создании обращения: {e}", exc_info=True)
+        
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=error_msg
+        )
     except Exception as e:
+        error_msg = f"Внутренняя ошибка при создании обращения. Обратитесь к администратору системы. (ID: {ticket_id})"
         logger.error(f"Ошибка при создании обращения: {e}", exc_info=True)
         
         # Логирование ошибки
@@ -229,7 +286,7 @@ async def create_ticket(request: TicketRequest) -> TicketResponse:
         
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Ошибка при создании обращения: {str(e)}"
+            detail=error_msg
         )
 
 
@@ -323,11 +380,20 @@ async def get_tickets(
             pages=pages
         )
         
+    except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+        error_msg = "База данных PostgreSQL недоступна. Пожалуйста, повторите попытку позже."
+        record_unavailability("postgresql", f"PostgreSQL error: {str(e)}")
+        logger.error(f"Ошибка подключения к PostgreSQL при получении списка обращений: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=error_msg
+        )
     except Exception as e:
+        error_msg = "Внутренняя ошибка при получении списка обращений. Обратитесь к администратору системы."
         logger.error(f"Ошибка при получении списка обращений: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Ошибка при получении списка: {str(e)}"
+            detail=error_msg
         )
 
 
@@ -395,11 +461,20 @@ async def get_ticket_detail(ticket_id: str) -> TicketDetailResponse:
         
     except HTTPException:
         raise
+    except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+        error_msg = "База данных PostgreSQL недоступна. Пожалуйста, повторите попытку позже."
+        record_unavailability("postgresql", f"PostgreSQL error: {str(e)}")
+        logger.error(f"Ошибка подключения к PostgreSQL при получении деталей обращения {ticket_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=error_msg
+        )
     except Exception as e:
+        error_msg = f"Внутренняя ошибка при получении деталей обращения. Обратитесь к администратору системы."
         logger.error(f"Ошибка при получении деталей обращения {ticket_id}: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Ошибка при получении деталей: {str(e)}"
+            detail=error_msg
         )
 
 
@@ -483,11 +558,20 @@ async def get_ticket_status(ticket_id: str) -> TicketStatusResponse:
         
     except HTTPException:
         raise
+    except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+        error_msg = "База данных PostgreSQL недоступна. Пожалуйста, повторите попытку позже."
+        record_unavailability("postgresql", f"PostgreSQL error: {str(e)}")
+        logger.error(f"Ошибка подключения к PostgreSQL при получении статуса обращения {ticket_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=error_msg
+        )
     except Exception as e:
+        error_msg = f"Внутренняя ошибка при получении статуса обращения. Обратитесь к администратору системы."
         logger.error(f"Ошибка при получении статуса обращения {ticket_id}: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Ошибка при получении статуса: {str(e)}"
+            detail=error_msg
         )
 
 
@@ -559,11 +643,20 @@ async def cancel_ticket(ticket_id: str, request: CancelRequest) -> CancelRespons
             
     except HTTPException:
         raise
+    except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+        error_msg = "База данных PostgreSQL недоступна. Пожалуйста, повторите попытку позже."
+        record_unavailability("postgresql", f"PostgreSQL error: {str(e)}")
+        logger.error(f"Ошибка подключения к PostgreSQL при отмене обращения {ticket_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=error_msg
+        )
     except Exception as e:
+        error_msg = f"Внутренняя ошибка при отмене обращения. Обратитесь к администратору системы."
         logger.error(f"Ошибка при отмене обращения {ticket_id}: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Ошибка при отмене обращения: {str(e)}"
+            detail=error_msg
         )
 
 
@@ -642,7 +735,11 @@ async def reprocess_ticket(ticket_id: str, request: ReprocessRequest) -> Reproce
                 "created_at": requeued_at.isoformat(),
                 "reprocess": True
             }
-            push_to_queue(QUEUE_PENDING_TICKETS, queue_data)
+            if not push_to_queue(QUEUE_PENDING_TICKETS, queue_data):
+                record_unavailability("redis", "Failed to push to queue in reprocess")
+                logger.warning(f"Не удалось добавить ticket {ticket_id} в очередь Redis при переоформлении")
+            else:
+                record_success("redis")
             
             logger.info(f"Обращение {ticket_id} переоформлено для повторной обработки")
             
@@ -655,11 +752,20 @@ async def reprocess_ticket(ticket_id: str, request: ReprocessRequest) -> Reproce
             
     except HTTPException:
         raise
+    except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+        error_msg = "База данных PostgreSQL недоступна. Пожалуйста, повторите попытку позже."
+        record_unavailability("postgresql", f"PostgreSQL error: {str(e)}")
+        logger.error(f"Ошибка подключения к PostgreSQL при переоформлении обращения {ticket_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=error_msg
+        )
     except Exception as e:
+        error_msg = f"Внутренняя ошибка при переоформлении обращения. Обратитесь к администратору системы."
         logger.error(f"Ошибка при переоформлении обращения {ticket_id}: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Ошибка при переоформлении: {str(e)}"
+            detail=error_msg
         )
 
 
@@ -707,19 +813,26 @@ async def create_batch_tickets(request: BatchTicketRequest) -> BatchTicketRespon
                 created_at = datetime.utcnow()
                 
                 # Сохранение в БД
-                with get_db_cursor() as cursor:
-                    cursor.execute("""
-                        INSERT INTO ticket_events (
-                            ticket_id, text, source, user_id, email, priority, 
-                            category_hint, metadata, status, created_at
-                        )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """, (
-                        ticket_id, ticket_req.text, ticket_req.source, ticket_req.user_id,
-                        ticket_req.email, ticket_req.priority, ticket_req.category_hint,
-                        json.dumps(ticket_req.metadata) if ticket_req.metadata else None,
-                        'queued', created_at
-                    ))
+                try:
+                    with get_db_cursor() as cursor:
+                        cursor.execute("""
+                            INSERT INTO ticket_events (
+                                ticket_id, text, source, user_id, email, priority, 
+                                category_hint, metadata, status, created_at
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """, (
+                            ticket_id, ticket_req.text, ticket_req.source, ticket_req.user_id,
+                            ticket_req.email, ticket_req.priority, ticket_req.category_hint,
+                            json.dumps(ticket_req.metadata) if ticket_req.metadata else None,
+                            'queued', created_at
+                        ))
+                    record_success("postgresql")
+                except (psycopg2.OperationalError, psycopg2.InterfaceError) as db_error:
+                    record_unavailability("postgresql", f"PostgreSQL error in batch: {str(db_error)}")
+                    failed += 1
+                    logger.error(f"Ошибка PostgreSQL при создании обращения {ticket_id} в пакете: {db_error}")
+                    continue
                 
                 # Добавление в очередь
                 queue_data = {
@@ -735,8 +848,10 @@ async def create_batch_tickets(request: BatchTicketRequest) -> BatchTicketRespon
                 
                 if push_to_queue(QUEUE_PENDING_TICKETS, queue_data):
                     queued += 1
+                    record_success("redis")
                 else:
                     failed += 1
+                    record_unavailability("redis", "Failed to push to queue in batch")
                     logger.warning(f"Не удалось добавить ticket {ticket_id} в очередь")
                     
             except Exception as e:
@@ -763,11 +878,20 @@ async def create_batch_tickets(request: BatchTicketRequest) -> BatchTicketRespon
             estimated_time=estimated_time
         )
         
+    except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+        error_msg = "База данных PostgreSQL недоступна. Пожалуйста, повторите попытку позже."
+        record_unavailability("postgresql", f"PostgreSQL error: {str(e)}")
+        logger.error(f"Ошибка подключения к PostgreSQL при пакетном создании обращений: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=error_msg
+        )
     except Exception as e:
+        error_msg = "Внутренняя ошибка при пакетном создании обращений. Обратитесь к администратору системы."
         logger.error(f"Ошибка при пакетном создании обращений: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Ошибка при пакетном создании: {str(e)}"
+            detail=error_msg
         )
 
 
@@ -781,6 +905,7 @@ async def create_batch_tickets(request: BatchTicketRequest) -> BatchTicketRespon
 - status: 'healthy' | 'unhealthy'
 - redis: 'connected' | 'disconnected' - статус подключения к Redis (очередь)
 - postgresql: 'connected' | 'disconnected' - статус подключения к PostgreSQL
+- config_service: 'connected' | 'disconnected' - статус подключения к Config Service
 
 **Статус 503:** возвращается, если Redis или PostgreSQL недоступны"""
 )
@@ -791,16 +916,33 @@ async def health_check():
         redis_client = get_redis_queue_client()
         redis_client.ping()
         redis_ok = True
-    except:
+        record_success("redis")
+    except Exception as e:
         redis_ok = False
+        record_unavailability("redis", f"Redis ping failed: {str(e)}")
     
     try:
         # Проверка подключения к PostgreSQL
         from shared.database import get_db_connection
         with get_db_connection():
             db_ok = True
-    except:
+        record_success("postgresql")
+    except Exception as e:
         db_ok = False
+        record_unavailability("postgresql", f"PostgreSQL connection failed: {str(e)}")
+    
+    # Проверка Config Service
+    config_ok = False
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            response = await client.get(f"{CONFIG_SERVICE_URL}/health")
+            if response.status_code == 200:
+                config_ok = True
+                record_success("config_service")
+            else:
+                record_unavailability("config_service", f"Config Service returned status {response.status_code}")
+    except Exception as e:
+        record_unavailability("config_service", f"Config Service check failed: {str(e)}")
     
     status_code = status.HTTP_200_OK if (redis_ok and db_ok) else status.HTTP_503_SERVICE_UNAVAILABLE
     
@@ -809,18 +951,58 @@ async def health_check():
         content={
             "status": "healthy" if (redis_ok and db_ok) else "unhealthy",
             "redis": "connected" if redis_ok else "disconnected",
-            "postgresql": "connected" if db_ok else "disconnected"
+            "postgresql": "connected" if db_ok else "disconnected",
+            "config_service": "connected" if config_ok else "disconnected"
         }
     )
 
 
+@app.get(
+    "/metrics/unavailability",
+    tags=["Metrics"],
+    summary="Метрики недоступности сервисов",
+    description="""Получение метрик недоступности соседних сервисов.
+    
+**Response (200):**
+- config_service: метрики недоступности Config Service
+- postgresql: метрики недоступности PostgreSQL
+- redis: метрики недоступности Redis
+
+Для каждого сервиса:
+- total_unavailability_count: общее количество событий недоступности
+- is_available: доступен ли сервис сейчас
+- last_unavailable_at: время последней недоступности (ISO datetime)
+- last_successful_check_at: время последней успешной проверки (ISO datetime)
+- time_since_unavailable_seconds: секунд с последней недоступности
+- time_since_successful_seconds: секунд с последней успешной проверки
+- recent_events_count: количество недавних событий
+- recent_events: последние 10 событий недоступности"""
+)
+async def get_unavailability_metrics():
+    """Получение метрик недоступности соседних сервисов"""
+    try:
+        metrics = get_metrics()
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content=metrics
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при получении метрик недоступности: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Ошибка при получении метрик недоступности"
+        )
+
+
 if __name__ == "__main__":
     import uvicorn
+    import os
+    log_level = os.getenv("LOG_LEVEL", "INFO").lower()
     uvicorn.run(
         "app:app",
         host=API_HOST,
         port=API_PORT,
         reload=False,
-        log_level=LOG_LEVEL.lower()
+        log_level=log_level
     )
 

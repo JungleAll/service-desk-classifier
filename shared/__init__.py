@@ -20,6 +20,11 @@ from .redis_client import (
     QUEUE_FAILED_TICKETS,
     CACHE_PREDICTIONS
 )
+from .logger import (
+    setup_logging,
+    get_logger,
+    configure_service_logging
+)
 
 __all__ = [
     "get_db_connection",
@@ -38,5 +43,8 @@ __all__ = [
     "QUEUE_PENDING_TICKETS",
     "QUEUE_FAILED_TICKETS",
     "CACHE_PREDICTIONS",
+    "setup_logging",
+    "get_logger",
+    "configure_service_logging",
 ]
 

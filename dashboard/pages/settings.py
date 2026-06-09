@@ -19,7 +19,19 @@ if 'auto_classification' not in st.session_state:
     st.session_state.auto_classification = True
 
 if 'confidence_threshold' not in st.session_state:
-    st.session_state.confidence_threshold = 0.7
+    # Пытаемся загрузить из Config Service
+    try:
+        api_client = APIClient()
+        config = api_client.get_config(use_mock=False)
+        threshold = config.get("confidence_threshold", 0.7)
+        # Убеждаемся, что значение в допустимом диапазоне
+        if threshold < 0.01:
+            threshold = 0.01
+        elif threshold > 1.0:
+            threshold = 1.0
+        st.session_state.confidence_threshold = threshold
+    except Exception:
+        st.session_state.confidence_threshold = 0.7
 
 if 'model_version' not in st.session_state:
     st.session_state.model_version = "v1.0"
@@ -45,25 +57,29 @@ def main():
     # Порог уверенности
     st.markdown("### 📊 Порог уверенности")
     
-    threshold = st.slider(
-        "Порог уверенности для автоматической обработки",
-        min_value=0.5,
-        max_value=1.0,
-        value=st.session_state.confidence_threshold,
-        step=0.05,
-        format="%.0f%%",
+    # Конвертируем значение из десятичной дроби (0.01-1.0) в проценты (1-100) для отображения
+    threshold_percent_current = int(st.session_state.confidence_threshold * 100)
+    
+    threshold_percent = st.slider(
+        "",
+        min_value=1,
+        max_value=100,
+        value=threshold_percent_current,
+        step=1,
+        format="%d%%",
         help="Обращения с уверенностью выше этого порога будут обрабатываться автоматически"
     )
     
-    threshold_percent = threshold * 100
+    # Конвертируем обратно в десятичную дробь для сохранения
+    threshold = threshold_percent / 100.0
     
     # Рекомендация
-    if threshold == 0.7:
-        st.success(f"✅ Текущее значение: {threshold_percent:.0f}% (рекомендуется)")
-    elif threshold < 0.7:
-        st.warning(f"⚠️ Текущее значение: {threshold_percent:.0f}% (низкий порог, больше автоматических обработок)")
+    if threshold_percent == 70:
+        st.success(f"✅ Текущее значение: {threshold_percent}% (рекомендуется)")
+    elif threshold_percent < 70:
+        st.warning(f"⚠️ Текущее значение: {threshold_percent}% (низкий порог, больше автоматических обработок)")
     else:
-        st.info(f"ℹ️ Текущее значение: {threshold_percent:.0f}% (высокий порог, больше ручных проверок)")
+        st.info(f"ℹ️ Текущее значение: {threshold_percent}% (высокий порог, больше ручных проверок)")
     
     st.markdown("<br>", unsafe_allow_html=True)
     
@@ -138,6 +154,21 @@ def main():
     if save_button:
         # Пытаемся применить версию модели через Config Service, затем перезагрузить модель в ML
         apply_ok = True
+        threshold_ok = True
+        
+        # Обновление порога уверенности
+        try:
+            resp = st.session_state.api_client.update_threshold(threshold)
+            if resp:
+                st.success(f"✅ Порог уверенности обновлен до {threshold_percent}% через Config Service")
+            else:
+                threshold_ok = False
+                st.warning("⚠️ Не удалось подтвердить обновление порога через Config Service")
+        except Exception as e:
+            threshold_ok = False
+            st.warning(f"⚠️ Ошибка обновления порога: {str(e)}")
+        
+        # Переключение версии модели
         try:
             resp = st.session_state.api_client.switch_model_version(selected_version)
             if resp and resp.get("current_model_version") == selected_version:
@@ -165,10 +196,10 @@ def main():
         st.session_state.model_version = selected_version
 
         # Итог и синхронизация выбора
-        if apply_ok:
-            st.success(f"✅ Настройки успешно сохранены и применены (модель: {selected_version})")
+        if apply_ok and threshold_ok:
+            st.success(f"✅ Настройки успешно сохранены и применены (порог: {threshold_percent}%, модель: {selected_version})")
         else:
-            st.info(f"ℹ️ Настройки сохранены локально (модель: {selected_version}). Примените их вручную при необходимости.")
+            st.info(f"ℹ️ Настройки сохранены локально (порог: {threshold_percent}%, модель: {selected_version}). Примените их вручную при необходимости.")
         
         # Информация о сохраненных настройках
         st.markdown("---")
@@ -185,7 +216,7 @@ def main():
         with settings_cols[1]:
             st.metric(
                 "Порог уверенности",
-                f"{threshold_percent:.0f}%"
+                f"{threshold_percent}%"
             )
         
         with settings_cols[2]:

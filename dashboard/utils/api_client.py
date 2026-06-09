@@ -443,4 +443,9 @@ class APIClient:
         """Переключить активную версию модели через Config Service"""
         payload = {"version": version, "gradual_rollout": False, "rollout_percentage": 100}
         return self._make_request("POST", "/config/model-version", data=payload, use_mock=False, service="config") or {}
+    
+    def update_threshold(self, threshold: float) -> Dict[str, Any]:
+        """Обновить порог уверенности через Config Service"""
+        payload = {"threshold": threshold}
+        return self._make_request("PUT", "/config/threshold", data=payload, use_mock=False, service="config") or {}
 

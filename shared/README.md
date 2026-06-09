@@ -1,11 +1,12 @@
 Shared Utilities
 
 Назначение
-- Общие утилиты для микросервисов: база данных и Redis
+- Общие утилиты для микросервисов: база данных, Redis и логирование
 
 Файлы
 - database.py: пул подключений к PostgreSQL, контекстный менеджер курсора
 - redis_client.py: клиент Redis, префиксы ключей и TTL для кэша предсказаний
+- logger.py: централизованный модуль логирования с поддержкой JSON формата для ElasticSearch
 - requirements.txt: зависимости общего уровня
 
 ENV для PostgreSQL
@@ -21,8 +22,18 @@ ENV для Redis
 - **Архитектура Redis:** Разделение на разные базы данных для изоляции очередей и кэша
   - См. `REDIS_ARCHITECTURE.md` для подробностей
 
+ENV для Логирования
+- LOG_LEVEL: уровень логирования (DEBUG, INFO, WARNING, ERROR, CRITICAL, по умолчанию: INFO)
+- LOG_DIR: директория для сохранения логов (по умолчанию: ./logs)
+- LOG_ENABLE_FILE: включить файловое логирование (по умолчанию: true)
+- LOG_ENABLE_JSON: включить JSON формат для файлов (по умолчанию: true)
+- LOG_ENABLE_STDOUT: включить вывод в stdout (по умолчанию: true)
+- LOG_MAX_BYTES: максимальный размер файла перед ротацией (по умолчанию: 10485760 = 10MB)
+- LOG_BACKUP_COUNT: количество резервных файлов (по умолчанию: 5)
+
 Рекомендации
 - Импортировать из shared вместо дублирования кода
+- Использовать централизованный модуль логирования для всех сервисов
 - Следить за единым форматом логирования и обработкой ошибок
 
 ---
@@ -229,5 +240,123 @@ else:
 
 ---
 
-**Подробнее:** См. `REDIS_ARCHITECTURE.md` для технических деталей
+## Централизованное логирование (logger.py)
+
+### Назначение
+
+Модуль `logger.py` предоставляет единый интерфейс для логирования во всех микросервисах с поддержкой:
+- **JSON формата** для интеграции с ElasticSearch
+- **Файлового вывода** с автоматической ротацией
+- **Stdout вывода** для совместимости с Docker logs
+- **Структурированных логов** с метаданными
+
+### Использование
+
+```python
+from shared.logger import configure_service_logging
+
+# Настройка логирования для сервиса
+logger = configure_service_logging("ingestion")
+
+# Базовое логирование
+logger.info("Сообщение")
+logger.warning("Предупреждение")
+logger.error("Ошибка", exc_info=True)
+
+# Логирование с дополнительными полями
+logger.info(
+    "Обращение обработано",
+    extra={"ticket_id": "tick_12345678", "duration_ms": 150}
+)
+```
+
+### Форматы логов
+
+#### JSON формат (для файлов)
+```json
+{
+  "@timestamp": "2025-01-19T10:30:45.123Z",
+  "service": "ingestion",
+  "level": "INFO",
+  "logger": "ingestion",
+  "message": "Обращение tick_12345678 создано",
+  "module": "app",
+  "function": "create_ticket",
+  "line": 207,
+  "ticket_id": "tick_12345678"
+}
+```
+
+#### Стандартный формат (для stdout)
+```
+2025-01-19 10:30:45 - ingestion - INFO - Обращение tick_12345678 создано
+```
+
+### Расположение логов
+
+- **В Docker контейнерах:** `/app/logs/{service}.log`
+- **Локально:** `./logs/{service}.log`
+
+Файлы логов:
+- `ingestion.log` - логи Ingestion Service
+- `ml.log` - логи ML Service (API)
+- `ml.worker.log` - логи ML Worker
+- `config.log` - логи Config Service
+- `output.log` - логи Output Service
+
+### Ротация логов
+
+Логи автоматически ротируются при достижении максимального размера:
+- `service.log` - текущий файл
+- `service.log.1` - предыдущий файл
+- `service.log.2` - файл на 2 ротации назад
+- ... и так далее до `service.log.5`
+
+### Интеграция с ElasticSearch
+
+JSON формат логов готов для интеграции через:
+- **Filebeat** → Logstash → ElasticSearch
+- **Fluentd** → ElasticSearch
+- Прямая отправка через Python библиотеку `elasticsearch`
+
+Подробная документация по интеграции: `LOGGING_GUIDE.md` (в корне проекта)
+
+### Примеры использования
+
+```python
+# Простое логирование
+logger.info("Сервис запущен")
+
+# Логирование с контекстом
+logger.info(
+    "Тикет обработан",
+    extra={
+        "ticket_id": "tick_123",
+        "request_id": "req_abc",
+        "duration_ms": 150
+    }
+)
+
+# Логирование ошибок
+try:
+    # код
+except Exception as e:
+    logger.error("Ошибка при обработке", exc_info=True, extra={"ticket_id": "tick_123"})
+```
+
+### Дополнительные поля
+
+Модуль поддерживает автоматическое добавление дополнительных полей в JSON логи:
+- `ticket_id` - ID тикета
+- `request_id` - ID запроса
+- `user_id` - ID пользователя
+- `duration_ms` - длительность операции в миллисекундах
+
+Эти поля передаются через параметр `extra` в методах логирования.
+
+---
+
+**Подробнее:** 
+- `REDIS_ARCHITECTURE.md` - технические детали Redis
+- `LOGGING_GUIDE.md` (в корне проекта) - полное руководство по логированию и интеграции с ElasticSearch
 
