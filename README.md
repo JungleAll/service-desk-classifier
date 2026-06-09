@@ -203,7 +203,7 @@ docker compose up -d
 
 Для запуска ML Service необходимо:
 
-1. Обучить модель по инструкции в [quick-start-guide.md](quick-start-guide.md) или ноутбуках в `notebooks/`
+1. Обучить модель по инструкции в [quick-start-guide.md](quick-start-guide.md)
 2. Разместить файлы в `models/v1.0/` (см. [models/v1.0/README_models.md](models/v1.0/README_models.md))
 
 ### Пример: создание и проверка обращения
@@ -232,7 +232,6 @@ service-desk-classifier/
 ├── shared/                # Общие модули (БД, Redis, логирование)
 ├── database/              # Схема PostgreSQL и миграции
 ├── models/                # Реестр ML-моделей
-├── notebooks/             # EDA и обучение модели
 └── docker-compose.yml
 ```
 
